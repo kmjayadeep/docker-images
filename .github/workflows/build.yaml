@@ -26,7 +26,7 @@ jobs:
       - name: Find Dockerfile directories
         id: find-dockerfiles
         run: |
-          DIRS=$(find . -type f -name 'Dockerfile' -exec dirname {} \; | sed 's|^./||')
+          DIRS=$(find . -type f -name 'Dockerfile' -exec dirname {} \; | sed 's|^./||' | tr '\n' ' ')
           echo "docker_dirs=$(echo $DIRS | jq -R -s -c 'split(" ")')" >> $GITHUB_OUTPUT
 
       - name: Build and push Docker images

@@ -23,16 +23,9 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Find Dockerfile directories
-        id: find-dockerfiles
-        run: |
-          DIRS=$(find . -type f -name 'Dockerfile' -exec dirname {} \; | sed 's|^./||')
-          echo "docker_dirs=$(echo $DIRS | jq -R -s -c 'split(" ")')" >> $GITHUB_OUTPUT
-
       - name: Build and push Docker images
         run: |
-          for DIR in ${{ steps.find-dockerfiles.outputs.docker_dirs }}; do
-            DIR=$(echo -n "$DIR" | tr -d '\n')
+          for DIR in "actions-runner"; do
             IMAGE_NAME="ghcr.io/${{ github.repository_owner }}/$(basename $DIR)"
             TIMESTAMP=$(date -u +"%Y%m%d%H%M%S")
             TAG="$IMAGE_NAME:$TIMESTAMP"

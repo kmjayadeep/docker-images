@@ -32,4 +32,9 @@ jobs:
             echo "Building and pushing $TAG"
             docker build -t $TAG $DIR
             docker push $TAG
+
+            TAG="$IMAGE_NAME:latest"
+            echo "Building and pushing $TAG"
+            docker build -t $TAG $DIR
+            docker push $TAG
           done

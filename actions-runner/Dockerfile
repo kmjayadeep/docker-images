@@ -5,4 +5,5 @@ RUN sudo apt-get update && sudo apt-get install -y --no-install-recommends \
   pkg-config \
   libssl-dev \
   libudev-dev \
-  g++
+  g++ \
+  nodejs

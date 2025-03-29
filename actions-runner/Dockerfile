@@ -7,4 +7,5 @@ RUN sudo apt-get update && sudo apt-get install -y --no-install-recommends \
   libudev-dev \
   g++ \
   gh \
-  nodejs
+  nodejs \
+  openssh-client

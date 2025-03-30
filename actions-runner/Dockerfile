@@ -18,4 +18,4 @@ RUN sudo apt-get update && sudo apt-get install -y --no-install-recommends \
   vault
 
 # Fix vault operation not permitted error
-RUN setcap -r /usr/bin/vault
+RUN sudo setcap -r /usr/bin/vault

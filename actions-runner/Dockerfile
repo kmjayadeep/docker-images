@@ -16,3 +16,6 @@ RUN echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/h
 
 RUN sudo apt-get update && sudo apt-get install -y --no-install-recommends \
   vault
+
+# Fix vault operation not permitted error
+RUN setcap -r /usr/bin/vault

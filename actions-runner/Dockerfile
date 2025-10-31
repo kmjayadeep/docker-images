@@ -1,4 +1,4 @@
-FROM summerwind/actions-runner:v2.328.0-ubuntu-22.04
+FROM summerwind/actions-runner:v2.329.0-ubuntu-22.04
 
 RUN sudo apt-get update && sudo apt-get install -y --no-install-recommends \
   cargo \

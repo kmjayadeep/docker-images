@@ -1,4 +1,4 @@
-FROM summerwind/actions-runner:v2.336.0-ubuntu-24.04
+FROM summerwind/actions-runner:v2.337.0-ubuntu-24.04
 
 RUN sudo apt-get update && sudo apt-get install -y --no-install-recommends \
   cargo \

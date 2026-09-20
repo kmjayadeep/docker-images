@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>vLLM Lab Chat</title>
+    <link rel="stylesheet" href="style.css?v=3">
+  </head>
+  <body>
+    <main class="app">
+      <header>
+        <div>
+          <h1>vLLM Lab Chat</h1>
+          <p>Minimal browser client for an OpenAI-compatible API</p>
+        </div>
+        <button id="clear" class="secondary" type="button">New chat</button>
+      </header>
+
+      <section class="settings" aria-label="Generation settings">
+        <label class="endpoint">
+          Server URL
+          <input id="endpoint" type="url" value="https://llm-gateway.cosmos.cboxlab.com" spellcheck="false" required>
+        </label>
+        <label>
+          Model
+          <select id="model"></select>
+        </label>
+        <label>
+          Temperature
+          <input id="temperature" type="number" min="0" max="2" step="0.1" value="0.7">
+        </label>
+        <label>
+          Max tokens
+          <input id="max-tokens" type="number" min="1" max="2048" step="1" value="256">
+        </label>
+        <label class="toggle" title="Allow the model to call the built-in time and calculator tools">
+          <input id="enable-tools" type="checkbox" checked>
+          Enable tools
+        </label>
+        <span id="status" role="status">Connecting…</span>
+      </section>
+
+      <section class="telemetry" aria-label="vLLM server metrics">
+        <div><span>Running</span><strong id="running">–</strong></div>
+        <div><span>Waiting</span><strong id="waiting">–</strong></div>
+        <div><span>KV cache</span><strong id="kv-cache">–</strong></div>
+        <div title="Cumulative cached tokens divided by queried tokens since server startup">
+          <span>Prefix cache hit</span><strong id="prefix-cache">–</strong>
+        </div>
+        <div><span>Prompt tokens</span><strong id="prompt-tokens">–</strong></div>
+        <div><span>Generated tokens</span><strong id="generated-tokens">–</strong></div>
+        <div><span>Finished requests</span><strong id="finished-requests">–</strong></div>
+        <div><span>Errors</span><strong id="errors">–</strong></div>
+      </section>
+
+      <section id="messages" class="messages" aria-live="polite">
+        <div class="empty">Send a message to the model.</div>
+      </section>
+
+      <form id="chat-form">
+        <label class="sr-only" for="prompt">Message</label>
+        <textarea id="prompt" rows="3" placeholder="Ask something…" required></textarea>
+        <button id="send" type="submit">Send</button>
+      </form>
+
+      <footer id="metrics">No request metrics yet.</footer>
+    </main>
+    <script src="app.js?v=4"></script>
+  </body>
+</html>

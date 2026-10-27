@@ -25,7 +25,7 @@ jobs:
 
       - name: Build and push Docker images
         run: |
-          for DIR in "actions-runner" "vllm-lab-ui" "kagent-telegram-bot"; do
+          for DIR in "actions-runner" "vllm-lab-ui" "kagent-telegram-bot" "mcp-server-fetch"; do
             IMAGE_NAME="ghcr.io/${{ github.repository_owner }}/$(basename $DIR)"
             TIMESTAMP=$(date -u +"%Y%m%d%H%M%S")
             TAG="$IMAGE_NAME:$TIMESTAMP"

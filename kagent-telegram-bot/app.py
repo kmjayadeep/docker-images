@@ -10,6 +10,12 @@ Two flows share this process:
    Repeat notifications of a group whose alerts all started more than ALERT_DEDUP_SECONDS
    ago are never investigated again, so the dedupe does not depend on process memory and
    a restart cannot re-trigger an investigation of a long-firing alert.
+3. Flux change webhook (POST /flux): Alertmanager delivers Flux notification-controller
+   events (alertname Flux*) here. After FLUX_VERIFY_DELAY_SECONDS the agent is asked for a
+   short verification of the changed namespace; one check per namespace per
+   FLUX_DEDUP_SECONDS. Nothing is posted for the alert itself or for resolved groups.
+4. Scheduled tasks (POST /task, JSON {"agent", "prompt", "title"}): a CronJob asks any agent
+   in the same kagent namespace a question and the answer is posted to the alert chat.
 
 Configuration is by environment variables; the bot token is never logged.
 """
@@ -34,6 +40,11 @@ BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ALLOWED_CHAT_IDS = [c.strip() for c in os.environ.get("TELEGRAM_CHAT_ID", "").split(",") if c.strip()]
 ALERT_CHAT_ID = ALLOWED_CHAT_IDS[0] if ALLOWED_CHAT_IDS else None
 A2A_URL = os.environ["KAGENT_A2A_URL"].rstrip("/") + "/"
+# .../api/a2a/<namespace>/<agent>/ -> .../api/a2a/<namespace>/ so /task can address sibling agents.
+A2A_BASE_URL = A2A_URL.rsplit("/", 2)[0] + "/"
+AGENT_NAME_RE = re.compile(r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$")
+FLUX_VERIFY_DELAY_SECONDS = int(os.environ.get("FLUX_VERIFY_DELAY_SECONDS", "120"))
+FLUX_DEDUP_SECONDS = int(os.environ.get("FLUX_DEDUP_SECONDS", "600"))
 A2A_TIMEOUT = float(os.environ.get("A2A_TIMEOUT_SECONDS", "600"))
 ALERT_DEDUP_SECONDS = int(os.environ.get("ALERT_DEDUP_SECONDS", "3600"))
 MAX_CONCURRENT_INVESTIGATIONS = int(os.environ.get("MAX_CONCURRENT_INVESTIGATIONS", "2"))
@@ -74,6 +85,7 @@ class Bot:
         self.http = ClientSession(timeout=ClientTimeout(total=A2A_TIMEOUT + 30))
         self.sessions: dict[str, str] = {}  # chat id -> A2A contextId
         self.last_investigation: dict[str, float] = {}  # alert group key -> epoch
+        self.last_flux_check: dict[str, float] = {}  # namespace -> epoch
         self.sem = asyncio.Semaphore(MAX_CONCURRENT_INVESTIGATIONS)
         self.ready = False
 
@@ -144,7 +156,8 @@ class Bot:
         await self.send(chat_id, answer)
 
     # ---------- A2A ----------
-    async def ask_agent(self, text: str, context_id: str) -> str:
+    async def ask_agent(self, text: str, context_id: str, agent: str | None = None) -> str:
+        url = f"{A2A_BASE_URL}{agent}/" if agent else A2A_URL
         payload = {
             "jsonrpc": "2.0",
             "id": str(uuid.uuid4()),
@@ -159,7 +172,7 @@ class Bot:
                 }
             },
         }
-        async with self.http.post(A2A_URL, json=payload, timeout=ClientTimeout(total=A2A_TIMEOUT)) as r:
+        async with self.http.post(url, json=payload, timeout=ClientTimeout(total=A2A_TIMEOUT)) as r:
             data = await r.json()
         if "error" in data:
             return f"Agent error: {json.dumps(data['error'])[:500]}"
@@ -234,6 +247,83 @@ class Bot:
                 answer = f"Investigation failed: {type(e).__name__}: {e}"
             await self.send(ALERT_CHAT_ID, f"🔎 {AGENT_NAME} on {name}:\n{answer}")
 
+    # ---------- Flux change verification ----------
+    async def flux(self, request: web.Request) -> web.Response:
+        if not ALERT_CHAT_ID:
+            return web.json_response({"error": "TELEGRAM_CHAT_ID not configured"}, status=503)
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid json"}, status=400)
+        if payload.get("status", "firing") != "firing":
+            return web.json_response({"ok": True, "checked": False})
+        alerts = payload.get("alerts") or []
+        changes: dict[str, list[str]] = {}
+        for a in alerts:
+            labels = a.get("labels", {})
+            ns = labels.get("namespace") or "unknown"
+            summary = (a.get("annotations", {}).get("message") or a.get("annotations", {}).get("summary") or "")
+            revision = labels.get("revision") or labels.get("kustomize.toolkit.fluxcd.io/revision") or ""
+            line = f'{labels.get("kind", "?")}/{ns}/{labels.get("name", "?")} {labels.get("reason", "")}'
+            if revision:
+                line += f" revision={revision}"
+            if summary:
+                line += f": {summary[:300]}"
+            changes.setdefault(ns, []).append(line)
+        log.info("flux webhook: %d alerts in namespaces %s", len(alerts), sorted(changes))
+        now = time.time()
+        started = []
+        for ns, lines in changes.items():
+            if now - self.last_flux_check.get(ns, 0) < FLUX_DEDUP_SECONDS:
+                continue
+            self.last_flux_check[ns] = now
+            started.append(ns)
+            asyncio.create_task(self.verify_flux_change(ns, lines))
+        return web.json_response({"ok": True, "checked": bool(started), "namespaces": started})
+
+    async def verify_flux_change(self, ns: str, lines: list[str]) -> None:
+        await asyncio.sleep(FLUX_VERIFY_DELAY_SECONDS)
+        async with self.sem:
+            prompt = (
+                f"Flux applied a change in namespace '{ns}' about {FLUX_VERIFY_DELAY_SECONDS}s ago. Events:\n"
+                + "\n".join(lines[:8])
+                + "\n\nVerify that the affected workloads are healthy now: Flux objects Ready, pods Ready with no "
+                "restarts since the change, no new firing alerts. Answer in at most 500 characters, plain text, no "
+                "headers: start with OK or PROBLEM, then one line per finding. If everything is fine, one sentence "
+                "is enough. Do not open a pull request."
+            )
+            try:
+                answer = await self.ask_agent(prompt, str(uuid.uuid4()))
+            except Exception as e:
+                log.exception("flux verification failed for %s", ns)
+                answer = f"Verification failed: {type(e).__name__}: {e}"
+            await self.send(ALERT_CHAT_ID, f"🔁 Flux change in {ns}:\n{answer}")
+
+    # ---------- Scheduled tasks ----------
+    async def task(self, request: web.Request) -> web.Response:
+        if not ALERT_CHAT_ID:
+            return web.json_response({"error": "TELEGRAM_CHAT_ID not configured"}, status=503)
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid json"}, status=400)
+        prompt = str(payload.get("prompt") or "").strip()
+        agent = str(payload.get("agent") or "").strip() or None
+        title = str(payload.get("title") or "task").strip()[:80]
+        if not prompt:
+            return web.json_response({"error": "prompt required"}, status=400)
+        if agent and not AGENT_NAME_RE.match(agent):
+            return web.json_response({"error": "invalid agent name"}, status=400)
+        log.info("task '%s' for agent %s", title, agent or AGENT_NAME)
+        async with self.sem:
+            try:
+                answer = await self.ask_agent(prompt, str(uuid.uuid4()), agent=agent)
+            except Exception as e:
+                log.exception("task '%s' failed", title)
+                answer = f"Task failed: {type(e).__name__}: {e}"
+        await self.send(ALERT_CHAT_ID, f"🗓 {title}:\n{answer}")
+        return web.json_response({"ok": True, "chars": len(answer)})
+
     async def healthz(self, request: web.Request) -> web.Response:
         return web.Response(text="ok" if self.ready else "starting", status=200 if self.ready else 503)
 
@@ -243,6 +333,8 @@ async def main() -> None:
     bot = Bot()
     app = web.Application()
     app.router.add_post("/alertmanager", bot.alertmanager)
+    app.router.add_post("/flux", bot.flux)
+    app.router.add_post("/task", bot.task)
     app.router.add_get("/healthz", bot.healthz)
     runner = web.AppRunner(app)
     await runner.setup()

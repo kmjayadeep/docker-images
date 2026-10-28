@@ -464,7 +464,10 @@ class Bot:
         comments = await self.gh.api("GET", f"/repos/{repo}/issues/{number}/comments?per_page=100")
         checks = await self.gh.api("GET", f"/repos/{repo}/commits/{sha}/check-runs?per_page=50")
         runs = checks.get("check_runs") or []
-        checks_ok = bool(runs) and all(r.get("status") == "completed" and r.get("conclusion") in ("success", "neutral", "skipped") for r in runs)
+        # Docs-only PRs have no check runs (the validation workflow runs on clusters/** only): that is fine for
+        # asking the operator, but automatic merges require at least one green check.
+        checks_ok = all(r.get("status") == "completed" and r.get("conclusion") in ("success", "neutral", "skipped") for r in runs)
+        has_checks = bool(runs)
         checks_pending = any(r.get("status") != "completed" for r in runs)
         own = self.gh.login
         verdict = ""
@@ -488,7 +491,8 @@ class Bot:
             "author": author, "renovate": author == RENOVATE_LOGIN, "agent": (pr["head"].get("ref") or "").startswith(AGENT_BRANCH_PREFIX),
             "draft": bool(pr.get("draft")), "mergeable_state": full.get("mergeable_state"), "labels": labels,
             "update_types": parse_renovate_update_types(pr.get("body") or "") if author == RENOVATE_LOGIN else set(),
-            "checks_ok": checks_ok, "checks_pending": checks_pending, "verdict": verdict, "asked": asked, "skipped": skipped,
+            "checks_ok": checks_ok, "has_checks": has_checks, "checks_pending": checks_pending, "verdict": verdict,
+            "asked": asked, "skipped": skipped,
         }
 
     async def evaluate_pr(self, repo: str, pr: dict) -> str | None:
@@ -499,7 +503,7 @@ class Bot:
         if f["mergeable_state"] not in ("clean",):
             return None  # unknown, dirty, behind or blocked: look again next pass
         auto = (f["renovate"] and f["verdict"] == "merge" and f["update_types"] and f["update_types"] <= AUTOMERGE_UPDATE_TYPES
-                and not (f["labels"] & AUTOMERGE_BLOCK_LABELS) and f["checks_ok"])
+                and not (f["labels"] & AUTOMERGE_BLOCK_LABELS) and f["has_checks"] and f["checks_ok"])
         if auto:
             why = f"renovate {','.join(sorted(f['update_types']))}, checks green, review verdict merge"
             ok, detail = await self.merge_pr(repo, f, by=f"policy ({why})")
@@ -510,7 +514,7 @@ class Bot:
         if not ask:
             return None
         kind = "renovate " + ",".join(sorted(f["update_types"]) or ["?"]) if f["renovate"] else "agent PR"
-        meta = f"{kind}, checks {'✅' if f['checks_ok'] else '—'}, verdict: {f['verdict'] or 'none'}"
+        meta = f"{kind}, checks {('✅' if f['checks_ok'] else '❌') if f['has_checks'] else 'none'}, verdict: {f['verdict'] or 'none'}"
         if f["labels"] & AUTOMERGE_BLOCK_LABELS:
             meta += ", " + ",".join(sorted(f["labels"] & AUTOMERGE_BLOCK_LABELS))
         text = f"🔀 #{n} {f['title']}\n{meta}\n{f['url']}"

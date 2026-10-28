@@ -7,6 +7,9 @@ Two flows share this process:
 2. Alertmanager webhook (POST /alertmanager): firing alerts produce an immediate short
    notification, then one agent investigation per alert group per ALERT_DEDUP_SECONDS,
    whose result is posted to the alert chat. Resolved alerts post a one-liner only.
+   Repeat notifications of a group whose alerts all started more than ALERT_DEDUP_SECONDS
+   ago are never investigated again, so the dedupe does not depend on process memory and
+   a restart cannot re-trigger an investigation of a long-firing alert.
 
 Configuration is by environment variables; the bot token is never logged.
 """
@@ -49,6 +52,21 @@ def redact(text: str) -> str:
 def chunks(text: str, size: int = TG_MAX_LEN):
     for i in range(0, len(text), size):
         yield text[i : i + size]
+
+
+def parse_rfc3339(value: str | None) -> float | None:
+    """Alertmanager timestamps ("2026-10-28T07:48:21.526100123Z") as epoch seconds; None if unparseable."""
+    if not value:
+        return None
+    try:
+        m = re.match(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?(Z|[+-]\d{2}:\d{2})$", value.strip())
+        if not m:
+            return None
+        frac = (m.group(2) or "")[:7]  # fromisoformat accepts at most 6 fractional digits
+        tz = "+00:00" if m.group(3) == "Z" else m.group(3)
+        return datetime.fromisoformat(f"{m.group(1)}{frac}{tz}").timestamp()
+    except ValueError:
+        return None
 
 
 class Bot:
@@ -185,6 +203,12 @@ class Bot:
         if status != "firing":
             return web.json_response({"ok": True, "investigated": False})
         now = time.time()
+        # Alertmanager re-sends a firing group every repeat_interval. Only a group with an alert that started
+        # inside the dedupe window is new; older repeats were investigated already (possibly before a restart).
+        starts = [t for t in (parse_rfc3339(a.get("startsAt")) for a in alerts) if t is not None]
+        if starts and now - max(starts) >= ALERT_DEDUP_SECONDS:
+            log.info("skipping investigation of %s: newest alert started %.0fs ago", name, now - max(starts))
+            return web.json_response({"ok": True, "investigated": False, "reason": "repeat of long-firing alert"})
         last = self.last_investigation.get(group_key, 0)
         if now - last < ALERT_DEDUP_SECONDS:
             return web.json_response({"ok": True, "investigated": False, "reason": "deduplicated"})

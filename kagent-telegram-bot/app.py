@@ -16,6 +16,13 @@ Two flows share this process:
    FLUX_DEDUP_SECONDS. Nothing is posted for the alert itself or for resolved groups.
 4. Scheduled tasks (POST /task, JSON {"agent", "prompt", "title"}): a CronJob asks any agent
    in the same kagent namespace a question and the answer is posted to the alert chat.
+5. Merge policy (optional, needs GITHUB_APP_* env): a deterministic pass over open pull requests
+   of GITHUB_REPOS, every MERGE_POLICY_INTERVAL_SECONDS and after a gitops task. Renovate PRs
+   whose update types are all in AUTOMERGE_UPDATE_TYPES, that carry no AUTOMERGE_BLOCK_LABELS,
+   whose checks are green and whose review comment from our own GitHub App says "Verdict: merge"
+   are merged by the bot itself. Every other reviewed Renovate PR and every kagent/* PR with
+   green checks is offered to the operator in Telegram with Merge and Skip buttons; the bot
+   merges only on the button press from an allow-listed chat. No model is on this path.
 
 Configuration is by environment variables; the bot token is never logged.
 """
@@ -45,6 +52,21 @@ A2A_BASE_URL = A2A_URL.rsplit("/", 2)[0] + "/"
 AGENT_NAME_RE = re.compile(r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$")
 FLUX_VERIFY_DELAY_SECONDS = int(os.environ.get("FLUX_VERIFY_DELAY_SECONDS", "120"))
 FLUX_DEDUP_SECONDS = int(os.environ.get("FLUX_DEDUP_SECONDS", "600"))
+# Merge policy (GitHub App credentials are the same Secret the GitHub MCP server uses).
+GITHUB_APP_ID = os.environ.get("GITHUB_APP_ID", "")
+GITHUB_APP_INSTALLATION_ID = os.environ.get("GITHUB_APP_INSTALLATION_ID", "")
+GITHUB_APP_PRIVATE_KEY = os.environ.get("GITHUB_APP_PRIVATE_KEY", "")
+GITHUB_REPOS = [r.strip() for r in os.environ.get("GITHUB_REPOS", "").split(",") if r.strip()]
+AUTOMERGE_UPDATE_TYPES = {t.strip() for t in os.environ.get("AUTOMERGE_UPDATE_TYPES", "patch,digest,pin,pinDigest").split(",") if t.strip()}
+AUTOMERGE_BLOCK_LABELS = {t.strip() for t in os.environ.get("AUTOMERGE_BLOCK_LABELS", "critical-infra").split(",") if t.strip()}
+MERGE_POLICY_INTERVAL_SECONDS = int(os.environ.get("MERGE_POLICY_INTERVAL_SECONDS", "1800"))
+MERGE_POLICY_ENABLED = bool(GITHUB_APP_ID and GITHUB_APP_INSTALLATION_ID and GITHUB_APP_PRIVATE_KEY and GITHUB_REPOS)
+RENOVATE_LOGIN = os.environ.get("RENOVATE_LOGIN", "renovate[bot]")
+AGENT_BRANCH_PREFIX = os.environ.get("AGENT_BRANCH_PREFIX", "kagent/")
+REVIEW_MARKER = "<!-- kagent-renovate-review -->"
+ASKED_MARKER = "<!-- kagent-merge-asked sha={sha} -->"
+SKIPPED_MARKER = "<!-- kagent-merge-skipped sha={sha} -->"
+GH_API = "https://api.github.com"
 A2A_TIMEOUT = float(os.environ.get("A2A_TIMEOUT_SECONDS", "600"))
 ALERT_DEDUP_SECONDS = int(os.environ.get("ALERT_DEDUP_SECONDS", "3600"))
 MAX_CONCURRENT_INVESTIGATIONS = int(os.environ.get("MAX_CONCURRENT_INVESTIGATIONS", "2"))
@@ -80,6 +102,71 @@ def parse_rfc3339(value: str | None) -> float | None:
         return None
 
 
+def parse_renovate_update_types(body: str) -> set[str]:
+    """Update types from the table Renovate puts in every PR body (column 'Update')."""
+    types: set[str] = set()
+    col = None
+    for line in body.splitlines():
+        line = line.strip()
+        if not line.startswith("|"):
+            if col is not None and types:
+                break
+            continue
+        cells = [c.strip() for c in line.strip("|").split("|")]
+        if col is None:
+            if "Update" in cells:
+                col = cells.index("Update")
+            continue
+        if cells and set("".join(cells)) <= set("-: "):
+            continue
+        if len(cells) > col and cells[col]:
+            types.add(cells[col].strip("`* "))
+    return types
+
+
+class GitHubApp:
+    """Minimal GitHub App client: short-lived installation tokens, no long-lived secret in memory
+    beyond the private key from the environment. Never log tokens or the key."""
+
+    def __init__(self, http: ClientSession) -> None:
+        import jwt  # PyJWT[crypto]
+
+        self._jwt = jwt
+        self.http = http
+        self._token = ""
+        self._token_exp = 0.0
+        self.login = ""
+
+    def _app_jwt(self) -> str:
+        now = int(time.time())
+        return self._jwt.encode({"iat": now - 60, "exp": now + 540, "iss": GITHUB_APP_ID}, GITHUB_APP_PRIVATE_KEY, algorithm="RS256")
+
+    async def _request(self, method: str, url: str, token: str, **kw):
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
+                   "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "kagent-telegram-bot"}
+        async with self.http.request(method, url, headers=headers, timeout=ClientTimeout(total=30), **kw) as r:
+            data = await r.json(content_type=None) if r.content_length != 0 else {}
+            if r.status >= 400:
+                raise RuntimeError(f"GitHub {method} {url.replace(GH_API, '')} -> {r.status}: {str(data.get('message') if isinstance(data, dict) else data)[:200]}")
+            return data
+
+    async def token(self) -> str:
+        if time.time() < self._token_exp - 300 and self._token:
+            return self._token
+        app_jwt = self._app_jwt()
+        if not self.login:
+            app = await self._request("GET", f"{GH_API}/app", app_jwt)
+            self.login = f"{app.get('slug', '')}[bot]"
+        data = await self._request("POST", f"{GH_API}/app/installations/{GITHUB_APP_INSTALLATION_ID}/access_tokens", app_jwt)
+        self._token = data["token"]
+        exp = parse_rfc3339(data.get("expires_at")) or (time.time() + 3000)
+        self._token_exp = exp
+        return self._token
+
+    async def api(self, method: str, path: str, **kw):
+        return await self._request(method, f"{GH_API}{path}", await self.token(), **kw)
+
+
 class Bot:
     def __init__(self) -> None:
         self.http = ClientSession(timeout=ClientTimeout(total=A2A_TIMEOUT + 30))
@@ -88,6 +175,8 @@ class Bot:
         self.last_flux_check: dict[str, float] = {}  # namespace -> epoch
         self.sem = asyncio.Semaphore(MAX_CONCURRENT_INVESTIGATIONS)
         self.ready = False
+        self.gh = GitHubApp(self.http) if MERGE_POLICY_ENABLED else None
+        self.policy_lock = asyncio.Lock()
 
     # ---------- Telegram ----------
     async def tg(self, method: str, **params):
@@ -110,7 +199,7 @@ class Bot:
         self.ready = True
         while True:
             try:
-                params = {"timeout": 50, "allowed_updates": ["message"]}
+                params = {"timeout": 50, "allowed_updates": ["message", "callback_query"]}
                 if offset is not None:
                     params["offset"] = offset
                 data = await self.tg("getUpdates", **params)
@@ -119,6 +208,8 @@ class Bot:
                     msg = upd.get("message") or {}
                     if msg.get("text"):
                         asyncio.create_task(self.handle_message(msg))
+                    if upd.get("callback_query"):
+                        asyncio.create_task(self.handle_callback(upd["callback_query"]))
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # network hiccups: back off and keep polling
@@ -142,6 +233,13 @@ class Bot:
         if text.startswith("/new"):
             self.sessions.pop(chat_id, None)
             await self.send(chat_id, "New session started.")
+            return
+        if text.startswith("/prs"):
+            if not self.gh:
+                await self.send(chat_id, "Merge policy is not configured.")
+                return
+            summary = await self.merge_policy_pass(reason="/prs")
+            await self.send(chat_id, summary or "No open pull request needs a decision.")
             return
         if text.startswith("/"):
             await self.send(chat_id, "Unknown command. Use /new or just ask a question.")
@@ -322,7 +420,165 @@ class Bot:
                 log.exception("task '%s' failed", title)
                 answer = f"Task failed: {type(e).__name__}: {e}"
         await self.send(ALERT_CHAT_ID, f"🗓 {title}:\n{answer}")
+        if self.gh and agent and agent != AGENT_NAME:
+            asyncio.create_task(self.merge_policy_pass(reason=f"task {title}"))
         return web.json_response({"ok": True, "chars": len(answer)})
+
+    # ---------- Merge policy ----------
+    async def merge_policy_loop(self) -> None:
+        await asyncio.sleep(60)
+        while True:
+            try:
+                await self.merge_policy_pass(reason="timer")
+            except Exception:
+                log.exception("merge policy pass failed")
+            await asyncio.sleep(MERGE_POLICY_INTERVAL_SECONDS)
+
+    async def merge_policy_pass(self, reason: str) -> str:
+        """Evaluate every open PR once; returns a short human summary."""
+        if not self.gh:
+            return ""
+        async with self.policy_lock:
+            lines: list[str] = []
+            for repo in GITHUB_REPOS:
+                try:
+                    prs = await self.gh.api("GET", f"/repos/{repo}/pulls?state=open&per_page=50")
+                except Exception as e:
+                    log.warning("merge policy: cannot list PRs of %s: %s", repo, type(e).__name__)
+                    continue
+                for pr in prs:
+                    try:
+                        line = await self.evaluate_pr(repo, pr)
+                    except Exception as e:
+                        log.warning("merge policy: PR %s#%s: %s", repo, pr.get("number"), e)
+                        line = None
+                    if line:
+                        lines.append(line)
+            log.info("merge policy pass (%s): %d decisions", reason, len(lines))
+            return "\n".join(lines)
+
+    async def pr_facts(self, repo: str, pr: dict) -> dict:
+        number = pr["number"]
+        sha = pr["head"]["sha"]
+        full = await self.gh.api("GET", f"/repos/{repo}/pulls/{number}")
+        comments = await self.gh.api("GET", f"/repos/{repo}/issues/{number}/comments?per_page=100")
+        checks = await self.gh.api("GET", f"/repos/{repo}/commits/{sha}/check-runs?per_page=50")
+        runs = checks.get("check_runs") or []
+        checks_ok = bool(runs) and all(r.get("status") == "completed" and r.get("conclusion") in ("success", "neutral", "skipped") for r in runs)
+        checks_pending = any(r.get("status") != "completed" for r in runs)
+        own = self.gh.login
+        verdict = ""
+        asked = skipped = False
+        for c in comments:
+            body = c.get("body") or ""
+            if (c.get("user") or {}).get("login") != own:
+                continue
+            if REVIEW_MARKER in body:
+                m = re.search(r"Verdict:\**\s*\**\s*(merge|hold|needs human)", body, re.I)
+                if m:
+                    verdict = m.group(1).lower()
+            if ASKED_MARKER.format(sha=sha) in body:
+                asked = True
+            if SKIPPED_MARKER.format(sha=sha) in body:
+                skipped = True
+        labels = {l.get("name") for l in pr.get("labels") or []}
+        author = (pr.get("user") or {}).get("login") or ""
+        return {
+            "number": number, "sha": sha, "title": pr.get("title") or "", "url": pr.get("html_url") or "",
+            "author": author, "renovate": author == RENOVATE_LOGIN, "agent": (pr["head"].get("ref") or "").startswith(AGENT_BRANCH_PREFIX),
+            "draft": bool(pr.get("draft")), "mergeable_state": full.get("mergeable_state"), "labels": labels,
+            "update_types": parse_renovate_update_types(pr.get("body") or "") if author == RENOVATE_LOGIN else set(),
+            "checks_ok": checks_ok, "checks_pending": checks_pending, "verdict": verdict, "asked": asked, "skipped": skipped,
+        }
+
+    async def evaluate_pr(self, repo: str, pr: dict) -> str | None:
+        f = await self.pr_facts(repo, pr)
+        n = f["number"]
+        if f["draft"] or f["asked"] or f["skipped"] or f["checks_pending"]:
+            return None
+        if f["mergeable_state"] not in ("clean",):
+            return None  # unknown, dirty, behind or blocked: look again next pass
+        auto = (f["renovate"] and f["verdict"] == "merge" and f["update_types"] and f["update_types"] <= AUTOMERGE_UPDATE_TYPES
+                and not (f["labels"] & AUTOMERGE_BLOCK_LABELS) and f["checks_ok"])
+        if auto:
+            why = f"renovate {','.join(sorted(f['update_types']))}, checks green, review verdict merge"
+            ok, detail = await self.merge_pr(repo, f, by=f"policy ({why})")
+            text = (f"✅ Auto-merged #{n} {f['title']}\n{why}\n{f['url']}" if ok else f"⚠️ Auto-merge of #{n} failed: {detail}\n{f['url']}")
+            await self.send(ALERT_CHAT_ID, text)
+            return text.splitlines()[0]
+        ask = (f["renovate"] and f["verdict"] in ("merge", "hold", "needs human")) or (f["agent"] and f["checks_ok"])
+        if not ask:
+            return None
+        kind = "renovate " + ",".join(sorted(f["update_types"]) or ["?"]) if f["renovate"] else "agent PR"
+        meta = f"{kind}, checks {'✅' if f['checks_ok'] else '—'}, verdict: {f['verdict'] or 'none'}"
+        if f["labels"] & AUTOMERGE_BLOCK_LABELS:
+            meta += ", " + ",".join(sorted(f["labels"] & AUTOMERGE_BLOCK_LABELS))
+        text = f"🔀 #{n} {f['title']}\n{meta}\n{f['url']}"
+        keyboard = {"inline_keyboard": [[{"text": f"Merge #{n}", "callback_data": f"m:{GITHUB_REPOS.index(repo)}:{n}:{f['sha'][:12]}"},
+                                         {"text": "Skip", "callback_data": f"s:{GITHUB_REPOS.index(repo)}:{n}:{f['sha'][:12]}"}]]}
+        await self.tg("sendMessage", chat_id=ALERT_CHAT_ID, text=redact(text), disable_web_page_preview=True, reply_markup=keyboard)
+        await self.gh.api("POST", f"/repos/{repo}/issues/{n}/comments",
+                          json={"body": f"{ASKED_MARKER.format(sha=f['sha'])}\nMerge decision requested from the operator in Telegram ({meta})."})
+        return f"🔀 asked about #{n} ({meta})"
+
+    async def merge_pr(self, repo: str, f: dict, by: str) -> tuple[bool, str]:
+        try:
+            await self.gh.api("PUT", f"/repos/{repo}/pulls/{f['number']}/merge",
+                              json={"merge_method": "merge", "sha": f["sha"]})
+        except Exception as e:
+            log.warning("merge of %s#%s failed: %s", repo, f["number"], e)
+            return False, str(e)[:200]
+        log.info("merged %s#%s %s", repo, f["number"], by)
+        try:
+            await self.gh.api("DELETE", f"/repos/{repo}/git/refs/heads/{f['head_ref']}") if f.get("head_ref") else None
+        except Exception:
+            pass
+        return True, ""
+
+    async def handle_callback(self, cq: dict) -> None:
+        cq_id = cq.get("id")
+        chat_id = str(((cq.get("message") or {}).get("chat") or {}).get("id") or "")
+        from_id = str((cq.get("from") or {}).get("id") or "")
+        data = cq.get("data") or ""
+        if chat_id not in ALLOWED_CHAT_IDS or not self.gh:
+            await self.tg("answerCallbackQuery", callback_query_id=cq_id, text="Not authorized.")
+            return
+        try:
+            action, repo_idx, number, sha12 = data.split(":")
+            repo = GITHUB_REPOS[int(repo_idx)]
+            number = int(number)
+        except Exception:
+            await self.tg("answerCallbackQuery", callback_query_id=cq_id, text="Bad button data.")
+            return
+        await self.tg("answerCallbackQuery", callback_query_id=cq_id, text="Working…")
+        message_id = (cq.get("message") or {}).get("message_id")
+        old_text = (cq.get("message") or {}).get("text") or ""
+        log.info("callback %s on %s#%s from user %s", action, repo, number, from_id)
+        try:
+            pr = await self.gh.api("GET", f"/repos/{repo}/pulls/{number}")
+            f = await self.pr_facts(repo, pr)
+            f["head_ref"] = pr["head"].get("ref")
+            if pr.get("state") != "open":
+                outcome = f"ℹ️ #{number} is already {pr.get('state')}."
+            elif not f["sha"].startswith(sha12):
+                outcome = f"ℹ️ #{number} changed since this was asked; it will be offered again."
+            elif action == "s":
+                await self.gh.api("POST", f"/repos/{repo}/issues/{number}/comments",
+                                  json={"body": f"{SKIPPED_MARKER.format(sha=f['sha'])}\nOperator skipped the merge in Telegram."})
+                outcome = f"⏭ Skipped #{number}."
+            elif action == "m":
+                if f["mergeable_state"] != "clean" or (f["checks_pending"]):
+                    outcome = f"⚠️ #{number} is not mergeable right now (state {f['mergeable_state']}); try again later."
+                else:
+                    ok, detail = await self.merge_pr(repo, f, by=f"operator (telegram user {from_id})")
+                    outcome = f"✅ Merged #{number}." if ok else f"⚠️ Merge of #{number} failed: {detail}"
+            else:
+                outcome = "Unknown action."
+        except Exception as e:
+            log.exception("callback failed")
+            outcome = f"⚠️ {type(e).__name__}: {e}"
+        new_text = f"{old_text}\n{outcome}"[:TG_MAX_LEN]
+        await self.tg("editMessageText", chat_id=chat_id, message_id=message_id, text=redact(new_text), disable_web_page_preview=True)
 
     async def healthz(self, request: web.Request) -> web.Response:
         return web.Response(text="ok" if self.ready else "starting", status=200 if self.ready else 503)
@@ -339,11 +595,14 @@ async def main() -> None:
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", LISTEN_PORT).start()
-    log.info("listening on :%d, agent=%s, allowed chats=%d, alert chat configured=%s",
-             LISTEN_PORT, A2A_URL, len(ALLOWED_CHAT_IDS), bool(ALERT_CHAT_ID))
+    log.info("listening on :%d, agent=%s, allowed chats=%d, alert chat configured=%s, merge policy=%s repos=%s",
+             LISTEN_PORT, A2A_URL, len(ALLOWED_CHAT_IDS), bool(ALERT_CHAT_ID), MERGE_POLICY_ENABLED, GITHUB_REPOS)
+    policy_task = asyncio.create_task(bot.merge_policy_loop()) if bot.gh else None
     try:
         await bot.poll_telegram()
     finally:
+        if policy_task:
+            policy_task.cancel()
         await runner.cleanup()
         await bot.http.close()
 

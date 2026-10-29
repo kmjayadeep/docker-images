@@ -11,9 +11,9 @@ Telegram front end and Alertmanager webhook for a kagent agent, talking to it ov
 | `A2A_TIMEOUT_SECONDS` | Agent call timeout (default 600) |
 | `MAX_CONCURRENT_INVESTIGATIONS` | Default 2 |
 | `LISTEN_PORT` | HTTP port for `/alertmanager`, `/flux`, `/task` and `/healthz` (default 8080) |
-| `FLUX_VERIFY_DELAY_SECONDS` | Wait before verifying a Flux change (default 120) |
-| `FLUX_DEDUP_SECONDS` | One Flux verification per namespace per window (default 600) |
-| `FLUX_POST_OK` | Also post verdicts that start with `OK` (default `false`: only `PROBLEM` verdicts and failed verifications are posted; OK is logged) |
+| `FLUX_VERIFY_DELAY_SECONDS` | Wait before investigating a Flux failure, so transient errors can heal (default 120) |
+| `FLUX_DEDUP_SECONDS` | One Flux investigation per namespace per window (default 600) |
+| `FLUX_POST_OK` | Also post answers that start with `OK`, meaning the failure healed before the agent looked (default `false`: logged only) |
 | `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID`, `GITHUB_APP_PRIVATE_KEY` | Enable the merge policy (same Secret as the GitHub MCP server) |
 | `GITHUB_REPOS` | Comma-separated `owner/repo` list the merge policy watches |
 | `AUTOMERGE_UPDATE_TYPES` | Renovate update types the bot may merge on its own (default `patch,digest,pin,pinDigest`) |
@@ -21,7 +21,7 @@ Telegram front end and Alertmanager webhook for a kagent agent, talking to it ov
 | `MERGE_POLICY_INTERVAL_SECONDS` | Policy pass interval (default 1800); a pass also runs after every gitops `/task` and on `/prs` |
 
 Alertmanager receiver: `webhook_configs: [{url: http://<service>:8080/alertmanager, send_resolved: true}]`.
-Flux events: route `alertname =~ "^Flux"` (from the notification-controller `alertmanager` Provider) to `webhook_configs: [{url: http://<service>:8080/flux, send_resolved: false}]`; the bot asks the agent for a short health verdict per namespace.
+Flux events: route `alertname =~ "^Flux"` (from the notification-controller `alertmanager` Provider) to `webhook_configs: [{url: http://<service>:8080/flux, send_resolved: false}]`; the Flux Alert should send error events only (`eventSeverity: error`); the bot asks the agent to investigate the failing namespace.
 Scheduled tasks: `POST /task` with `{"agent": "<name in the same kagent namespace>", "prompt": "...", "title": "..."}`; the answer is posted to the alert chat. The `/task` endpoint takes `KAGENT_A2A_URL` with the agent segment replaced, so every agent in the namespace is reachable.
 Unauthorized chats get a reply containing their chat id and nothing else.
 

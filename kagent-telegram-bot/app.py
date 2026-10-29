@@ -10,10 +10,11 @@ Two flows share this process:
    Repeat notifications of a group whose alerts all started more than ALERT_DEDUP_SECONDS
    ago are never investigated again, so the dedupe does not depend on process memory and
    a restart cannot re-trigger an investigation of a long-firing alert.
-3. Flux change webhook (POST /flux): Alertmanager delivers Flux notification-controller
-   events (alertname Flux*) here. After FLUX_VERIFY_DELAY_SECONDS the agent is asked for a
-   short verification of the changed namespace; one check per namespace per
-   FLUX_DEDUP_SECONDS. Nothing is posted for the alert itself or for resolved groups.
+3. Flux failure webhook (POST /flux): Alertmanager delivers Flux notification-controller
+   error events (alertname Flux*: reconciliation or health check failed, Helm install/upgrade
+   failed). After FLUX_VERIFY_DELAY_SECONDS the agent investigates the namespace, at most once per
+   FLUX_DEDUP_SECONDS. Successful changes never reach the agent; an answer that starts with OK
+   (the failure healed itself) is logged, not posted.
 4. Scheduled tasks (POST /task, JSON {"agent", "prompt", "title"}): a CronJob asks any agent
    in the same kagent namespace a question and the answer is posted to the alert chat.
 5. Merge policy (optional, needs GITHUB_APP_* env): a deterministic pass over open pull requests
@@ -52,7 +53,7 @@ A2A_BASE_URL = A2A_URL.rsplit("/", 2)[0] + "/"
 AGENT_NAME_RE = re.compile(r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$")
 FLUX_VERIFY_DELAY_SECONDS = int(os.environ.get("FLUX_VERIFY_DELAY_SECONDS", "120"))
 FLUX_DEDUP_SECONDS = int(os.environ.get("FLUX_DEDUP_SECONDS", "600"))
-# Post OK verdicts too? By default only PROBLEM verdicts and failures reach the chat; OK is logged.
+# Post OK answers too (the failure healed before the agent looked)? Default: log only.
 FLUX_POST_OK = os.environ.get("FLUX_POST_OK", "false").lower() in ("1", "true", "yes")
 # Merge policy (GitHub App credentials are the same Secret the GitHub MCP server uses).
 GITHUB_APP_ID = os.environ.get("GITHUB_APP_ID", "")
@@ -347,7 +348,7 @@ class Bot:
                 answer = f"Investigation failed: {type(e).__name__}: {e}"
             await self.send(ALERT_CHAT_ID, f"🔎 {AGENT_NAME} on {name}:\n{answer}")
 
-    # ---------- Flux change verification ----------
+    # ---------- Flux failure investigation ----------
     async def flux(self, request: web.Request) -> web.Response:
         if not ALERT_CHAT_ID:
             return web.json_response({"error": "TELEGRAM_CHAT_ID not configured"}, status=503)
@@ -385,22 +386,23 @@ class Bot:
         await asyncio.sleep(FLUX_VERIFY_DELAY_SECONDS)
         async with self.sem:
             prompt = (
-                f"Flux applied a change in namespace '{ns}' about {FLUX_VERIFY_DELAY_SECONDS}s ago. Events:\n"
+                f"Flux reported a failure in namespace '{ns}' about {FLUX_VERIFY_DELAY_SECONDS}s ago. Events:\n"
                 + "\n".join(lines[:8])
-                + "\n\nVerify that the affected workloads are healthy now: Flux objects Ready, pods Ready with no "
-                "restarts since the change, no new firing alerts. Answer in at most 500 characters, plain text, no "
-                "headers: start with OK or PROBLEM, then one line per finding. If everything is fine, one sentence "
-                "is enough. Do not open a pull request."
+                + "\n\nCheck whether it is still failing. If the Flux objects are Ready again and the workloads are "
+                "healthy, answer with one sentence starting with OK. Otherwise start with PROBLEM and give, in at most "
+                "600 characters of plain text without headers: what is failing, the cause from the evidence, and the "
+                "Git change that fixes it. If that change is concrete, hand it to homelab-gitops as usual and end "
+                "with the PR URL."
             )
             try:
                 answer = await self.ask_agent(prompt, str(uuid.uuid4()))
             except Exception as e:
-                log.exception("flux verification failed for %s", ns)
-                answer = f"Verification failed: {type(e).__name__}: {e}"
+                log.exception("flux failure investigation failed for %s", ns)
+                answer = f"Investigation failed: {type(e).__name__}: {e}"
             if answer.lstrip().upper().startswith("OK") and not FLUX_POST_OK:
-                log.info("flux change in %s verified OK (not posted): %s", ns, answer[:200].replace("\n", " "))
+                log.info("flux failure in %s healed (not posted): %s", ns, answer[:200].replace("\n", " "))
                 return
-            await self.send(ALERT_CHAT_ID, f"🔁 Flux change in {ns}:\n{answer}")
+            await self.send(ALERT_CHAT_ID, f"🔁 Flux failure in {ns}:\n{answer}")
 
     # ---------- Scheduled tasks ----------
     async def task(self, request: web.Request) -> web.Response:

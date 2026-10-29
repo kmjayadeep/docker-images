@@ -13,6 +13,7 @@ Telegram front end and Alertmanager webhook for a kagent agent, talking to it ov
 | `LISTEN_PORT` | HTTP port for `/alertmanager`, `/flux`, `/task` and `/healthz` (default 8080) |
 | `FLUX_VERIFY_DELAY_SECONDS` | Wait before verifying a Flux change (default 120) |
 | `FLUX_DEDUP_SECONDS` | One Flux verification per namespace per window (default 600) |
+| `FLUX_POST_OK` | Also post verdicts that start with `OK` (default `false`: only `PROBLEM` verdicts and failed verifications are posted; OK is logged) |
 | `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID`, `GITHUB_APP_PRIVATE_KEY` | Enable the merge policy (same Secret as the GitHub MCP server) |
 | `GITHUB_REPOS` | Comma-separated `owner/repo` list the merge policy watches |
 | `AUTOMERGE_UPDATE_TYPES` | Renovate update types the bot may merge on its own (default `patch,digest,pin,pinDigest`) |

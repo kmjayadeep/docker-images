@@ -52,6 +52,8 @@ A2A_BASE_URL = A2A_URL.rsplit("/", 2)[0] + "/"
 AGENT_NAME_RE = re.compile(r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$")
 FLUX_VERIFY_DELAY_SECONDS = int(os.environ.get("FLUX_VERIFY_DELAY_SECONDS", "120"))
 FLUX_DEDUP_SECONDS = int(os.environ.get("FLUX_DEDUP_SECONDS", "600"))
+# Post OK verdicts too? By default only PROBLEM verdicts and failures reach the chat; OK is logged.
+FLUX_POST_OK = os.environ.get("FLUX_POST_OK", "false").lower() in ("1", "true", "yes")
 # Merge policy (GitHub App credentials are the same Secret the GitHub MCP server uses).
 GITHUB_APP_ID = os.environ.get("GITHUB_APP_ID", "")
 GITHUB_APP_INSTALLATION_ID = os.environ.get("GITHUB_APP_INSTALLATION_ID", "")
@@ -395,6 +397,9 @@ class Bot:
             except Exception as e:
                 log.exception("flux verification failed for %s", ns)
                 answer = f"Verification failed: {type(e).__name__}: {e}"
+            if answer.lstrip().upper().startswith("OK") and not FLUX_POST_OK:
+                log.info("flux change in %s verified OK (not posted): %s", ns, answer[:200].replace("\n", " "))
+                return
             await self.send(ALERT_CHAT_ID, f"🔁 Flux change in {ns}:\n{answer}")
 
     # ---------- Scheduled tasks ----------

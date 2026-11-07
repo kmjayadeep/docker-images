@@ -19,6 +19,8 @@ Telegram front end and Alertmanager webhook for a kagent agent, talking to it ov
 | `AUTOMERGE_UPDATE_TYPES` | Renovate update types the bot may merge on its own (default `patch,digest,pin,pinDigest`) |
 | `AUTOMERGE_BLOCK_LABELS` | Labels that always require the operator (default `critical-infra`) |
 | `MERGE_POLICY_INTERVAL_SECONDS` | Policy pass interval (default 1800); a pass also runs after every gitops `/task` and on `/prs` |
+| `MUSIC_MCP_URL` | music-mcp base URL (for example `http://music-mcp.kagent.svc.cluster.local:8000`); enables `/music` and the 👍/👎/⬇ buttons under a digest. Unset disables both |
+| `MUSIC_AGENT` | Agent for `/music` and whose `/task` answers get digest buttons (default `music-curator`) |
 
 Alertmanager receiver: `webhook_configs: [{url: http://<service>:8080/alertmanager, send_resolved: true}]`.
 Flux events: route `alertname =~ "^Flux"` (from the notification-controller `alertmanager` Provider) to `webhook_configs: [{url: http://<service>:8080/flux, send_resolved: false}]`; the Flux Alert should send error events only (`eventSeverity: error`); the bot asks the agent to investigate the failing namespace.

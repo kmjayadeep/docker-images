@@ -27,7 +27,7 @@ Two flows share this process:
 6. Music digest feedback (optional, needs MUSIC_MCP_URL): after an answer from MUSIC_AGENT (the
    weekly /task digest or a /music question) the bot reads the digest that run stored in music-mcp
    (GET /digest) and posts one 👍/👎/⬇ button row per item. A press is sent to music-mcp
-   (POST /feedback); nothing goes through a model. /music <question> talks to MUSIC_AGENT in its
+   (POST /feedback); nothing goes through a model. The title button opens a Qobuz store search. /music <question> talks to MUSIC_AGENT in its
    own session per chat.
 
 Configuration is by environment variables; the bot token is never logged.
@@ -42,6 +42,7 @@ import os
 import re
 import time
 import uuid
+from urllib.parse import quote
 from datetime import datetime, timezone
 
 from aiohttp import ClientSession, ClientTimeout, web
@@ -70,6 +71,9 @@ AUTOMERGE_BLOCK_LABELS = {t.strip() for t in os.environ.get("AUTOMERGE_BLOCK_LAB
 MUSIC_MCP_URL = os.environ.get("MUSIC_MCP_URL", "").rstrip("/")
 MUSIC_AGENT = os.environ.get("MUSIC_AGENT", "music-curator")
 MUSIC_ACTIONS = {"l": ("like", "👍"), "d": ("dislike", "👎"), "w": ("want", "⬇")}
+# Qobuz store whose search the title button opens, as in https://www.qobuz.com/ch-fr/search/tracks/...
+# Empty keeps the title button as a plain label.
+QOBUZ_STORE = os.environ.get("QOBUZ_STORE", "ch-fr").strip("/")
 MERGE_POLICY_INTERVAL_SECONDS = int(os.environ.get("MERGE_POLICY_INTERVAL_SECONDS", "1800"))
 MERGE_POLICY_ENABLED = bool(GITHUB_APP_ID and GITHUB_APP_INSTALLATION_ID and GITHUB_APP_PRIVATE_KEY and GITHUB_REPOS)
 RENOVATE_LOGIN = os.environ.get("RENOVATE_LOGIN", "renovate[bot]")
@@ -312,10 +316,26 @@ class Bot:
                       reply_markup={"inline_keyboard": rows})
 
     @staticmethod
+    def qobuz_search_url(item: dict) -> str | None:
+        """Qobuz store search for a digest item: short title plus first artist for tracks, title for albums."""
+        title = re.split(r"\s*[(\[]", item.get("title") or "")[0].strip()
+        if not QOBUZ_STORE or not title:
+            return None
+        if item.get("kind") == "album":
+            section, query = "albums", title
+        else:
+            artist = re.split(r"\s*(?:,|&| feat\.? | ft\.? )\s*", item.get("artist") or "")[0].strip()
+            section, query = "tracks", f"{title} {artist}".strip()
+        return f"https://www.qobuz.com/{QOBUZ_STORE}/search/{section}/{quote(query, safe='')}"
+
+    @staticmethod
     def music_row(item: dict, chosen: str | None = None) -> list[dict]:
-        label = f"{item['id']}. {item.get('title', '')}"[:24]
+        short = re.split(r"\s*[(\[]", item.get("title") or "")[0].strip() or item.get("title", "")
+        label = f"{item['id']}. {short}"[:24]
         chosen = chosen or {"like": "l", "dislike": "d", "want": "w"}.get(item.get("feedback") or "")
-        row = [{"text": label, "callback_data": f"f:{item['id']}:n"}]
+        url = Bot.qobuz_search_url(item)
+        # The title cell opens the Qobuz search when there is one, otherwise it is a plain label.
+        row = [{"text": f"🔎 {label}", "url": url} if url else {"text": label, "callback_data": f"f:{item['id']}:n"}]
         for code, (_, emoji) in MUSIC_ACTIONS.items():
             row.append({"text": f"✓{emoji}" if code == chosen else emoji, "callback_data": f"f:{item['id']}:{code}"})
         return row
@@ -353,7 +373,7 @@ class Bot:
         keyboard = (message.get("reply_markup") or {}).get("inline_keyboard") or []
         new_rows = []
         for row in keyboard:
-            if row and row[0].get("callback_data") == f"f:{sid}:n":
+            if any(str(b.get("callback_data", "")).startswith(f"f:{sid}:") for b in row):
                 label = row[0]  # keep the title cell exactly as posted
                 row = [label] + self.music_row({"id": sid}, chosen=code)[1:]
             new_rows.append(row)

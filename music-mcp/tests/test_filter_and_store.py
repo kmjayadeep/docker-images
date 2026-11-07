@@ -127,7 +127,7 @@ def test_record_digest_appends_and_fixes_links(env, monkeypatch):
                                         "url": "https://music.youtube.com/browse/MPREb"}]))
     assert first["digest_id"] == second["digest_id"]
     assert second["digest_items_total"] == 2
-    assert looked_up == ["Vidyasagar Oru Maravathoor Kanavu"]
+    assert looked_up == ["Oru Maravathoor Kanavu Vidyasagar"]
     assert second["stored"][0]["url"] == "https://music.youtube.com/watch?v=abcdefghijk"
 
 
@@ -161,7 +161,8 @@ def test_digest_candidates_auto_seeds_and_albums(env, monkeypatch):
     async def related_tracks(artist, title, limit):
         seed = {"artist": artist, "title": title}
         rel = [
-            {"kind": "track", "artist": "Vidyasagar, Sujatha", "title": "Song A", "album": "Film X", "source": "ytmusic-radio", "score": 1},
+            {"kind": "track", "artist": "Vidyasagar, Sujatha", "title": "Song A", "album": "Film X", "source": "ytmusic-radio", "score": 1,
+             "album_url": "https://music.youtube.com/browse/MPREb_abcdefgh"},
             {"kind": "track", "artist": "Vidyasagar", "title": "Song B", "album": "Film X", "source": "ytmusic-radio", "score": 0.9},
             {"kind": "track", "artist": "Shaan Rahman, Gowry Lekshmi", "title": "Aaro Nenjil", "album": "Godha", "source": "ytmusic-radio", "score": 0.8},
         ]
@@ -185,4 +186,5 @@ def test_digest_candidates_auto_seeds_and_albums(env, monkeypatch):
     titles = [t["title"] for t in res["tracks"]]
     assert "Aaro Nenjil" not in titles and "Song A" in titles
     assert res["albums"][0]["title"] == "Film X" and res["albums"][0]["count"] == 2
+    assert res["albums"][0]["url"] == "https://music.youtube.com/browse/MPREb_abcdefgh"
     assert res["similar_artists"][0]["artist"] == "Sushin Shyam"

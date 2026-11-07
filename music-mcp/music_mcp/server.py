@@ -35,6 +35,7 @@ log = logging.getLogger("music-mcp")
 YTM_URL_RE = re.compile(
     r"^https://music\.youtube\.com/(watch\?v=[\w-]{11}|browse/MPREb_[\w-]{8,}|channel/UC[\w-]{20,}|playlist\?list=[\w-]{10,})$"
 )
+_BRACKETS = re.compile(r"\s*[\(\[].*?[\)\]]")
 # A digest run that calls record_digest more than once within this window keeps adding to one digest.
 OPEN_DIGEST_MINUTES = int(os.environ.get("OPEN_DIGEST_MINUTES", "40"))
 
@@ -371,7 +372,8 @@ async def digest_candidates(seeds: list[dict] | None = None, max_seeds: int = 5,
         if not name or lib.owns_album(t["artist"], name):
             continue
         a = album_hits.setdefault(name.lower(), {"title": name, "artist": t["artist"], "year": t.get("year"),
-                                                 "seed": t["seed"], "count": 0})
+                                                 "url": t.get("album_url"), "seed": t["seed"], "count": 0})
+        a["url"] = a["url"] or t.get("album_url")
         a["count"] += 1
     albums = sorted((a for a in album_hits.values() if a["count"] >= 2), key=lambda a: -a["count"])[:8]
     for a in albums:
@@ -432,8 +434,15 @@ async def record_digest(items: list[dict], note: str | None = None) -> dict:
             it["url"] = None
             try:
                 kind = "songs" if it["kind"] == "track" else "albums"
-                hits = await ytm().search(f'{it["artist"]} {it["title"]}', kind, 1)
-                it["url"] = hits[0]["url"] if hits else None
+                # Long credit lists and "(Original Motion Picture Soundtrack)" make YouTube Music search miss;
+                # the short title with the first artist finds it.
+                first = (split_artists(it["artist"]) or [it["artist"]])[0]
+                short = _BRACKETS.sub("", it["title"]).strip() or it["title"]
+                for query in (f"{short} {first}", f'{it["artist"]} {it["title"]}'):
+                    hits = await ytm().search(query, kind, 1)
+                    if hits and hits[0].get("url"):
+                        it["url"] = hits[0]["url"]
+                        break
             except Exception as e:
                 log.warning("link lookup failed: %s", e)
         accepted.append(it)

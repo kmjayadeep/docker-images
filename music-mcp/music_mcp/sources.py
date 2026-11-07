@@ -92,6 +92,7 @@ class YtMusic:
             "artist": _names(s.get("artists")),
             "title": s.get("title", ""),
             "album": album.get("name") if isinstance(album, dict) else None,
+            "album_url": YTM_BROWSE.format(album["id"]) if isinstance(album, dict) and album.get("id") else None,
             "year": s.get("year"),
             "source": source,
             "url": YTM_WATCH.format(s["videoId"]) if s.get("videoId") else None,

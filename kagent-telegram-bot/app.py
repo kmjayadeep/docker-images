@@ -24,11 +24,12 @@ Two flows share this process:
    are merged by the bot itself. Every other reviewed Renovate PR and every kagent/* PR with
    green checks is offered to the operator in Telegram with Merge and Skip buttons; the bot
    merges only on the button press from an allow-listed chat. No model is on this path.
-6. Music digest feedback (optional, needs MUSIC_MCP_URL): after an answer from MUSIC_AGENT (the
-   weekly /task digest or a /music question) the bot reads the digest that run stored in music-mcp
-   (GET /digest) and posts one 👍/👎/⬇ button row per item. A press is sent to music-mcp
-   (POST /feedback); nothing goes through a model. The title button opens a Qobuz store search. /music <question> talks to MUSIC_AGENT in its
-   own session per chat.
+6. Curator digest feedback (optional, needs MUSIC_MCP_URL and/or MOVIE_MCP_URL): after an answer
+   from MUSIC_AGENT or MOVIE_AGENT (a weekly /task digest, or a /music or /movie question) the bot
+   reads the digest that run stored in that agent's MCP server (GET /digest) and posts one 👍/👎/⬇
+   button row per item. A press is sent to the server (POST /feedback); nothing goes through a
+   model. The title button opens the item's page (movies: TMDB) or a Qobuz search (music).
+   /music and /movie talk to their agent in a separate session per chat.
 
 Configuration is by environment variables; the bot token is never logged.
 """
@@ -70,10 +71,24 @@ AUTOMERGE_UPDATE_TYPES = {t.strip() for t in os.environ.get("AUTOMERGE_UPDATE_TY
 AUTOMERGE_BLOCK_LABELS = {t.strip() for t in os.environ.get("AUTOMERGE_BLOCK_LABELS", "critical-infra").split(",") if t.strip()}
 MUSIC_MCP_URL = os.environ.get("MUSIC_MCP_URL", "").rstrip("/")
 MUSIC_AGENT = os.environ.get("MUSIC_AGENT", "music-curator")
-MUSIC_ACTIONS = {"l": ("like", "👍"), "d": ("dislike", "👎"), "w": ("want", "⬇")}
+MOVIE_MCP_URL = os.environ.get("MOVIE_MCP_URL", "").rstrip("/")
+MOVIE_AGENT = os.environ.get("MOVIE_AGENT", "movie-curator")
+DIGEST_ACTIONS = {"l": ("like", "👍"), "d": ("dislike", "👎"), "w": ("want", "⬇")}
 # Qobuz store whose search the title button opens, as in https://www.qobuz.com/ch-fr/search/tracks/...
 # Empty keeps the title button as a plain label.
 QOBUZ_STORE = os.environ.get("QOBUZ_STORE", "ch-fr").strip("/")
+# Curator agents whose answers get digest feedback buttons. The prefix is the callback-data namespace;
+# "f" stays music so buttons posted before movies existed keep working.
+CURATORS = [c for c in (
+    {"prefix": "f", "kind": "music", "command": "/music", "emoji": "🎵", "name": "music curator",
+     "agent": MUSIC_AGENT, "url": MUSIC_MCP_URL, "want": "want it in the library",
+     "examples": ["/music more like Vidyasagar's 2000s songs", "/music new Malayalam film albums this month"]},
+    {"prefix": "v", "kind": "movie", "command": "/movie", "emoji": "🎬", "name": "movie curator",
+     "agent": MOVIE_AGENT, "url": MOVIE_MCP_URL, "want": "want to watch",
+     "examples": ["/movie something like Bulbbul", "/movie new Malayalam thrillers this month"]},
+) if c["url"]]
+CURATOR_BY_PREFIX = {c["prefix"]: c for c in CURATORS}
+CURATOR_BY_AGENT = {c["agent"]: c for c in CURATORS}
 MERGE_POLICY_INTERVAL_SECONDS = int(os.environ.get("MERGE_POLICY_INTERVAL_SECONDS", "1800"))
 MERGE_POLICY_ENABLED = bool(GITHUB_APP_ID and GITHUB_APP_INSTALLATION_ID and GITHUB_APP_PRIVATE_KEY and GITHUB_REPOS)
 RENOVATE_LOGIN = os.environ.get("RENOVATE_LOGIN", "renovate[bot]")
@@ -186,7 +201,7 @@ class Bot:
     def __init__(self) -> None:
         self.http = ClientSession(timeout=ClientTimeout(total=A2A_TIMEOUT + 30))
         self.sessions: dict[str, str] = {}  # chat id -> A2A contextId
-        self.music_sessions: dict[str, str] = {}  # chat id -> A2A contextId for MUSIC_AGENT
+        self.curator_sessions: dict[tuple[str, str], str] = {}  # (curator prefix, chat id) -> A2A contextId
         self.last_investigation: dict[str, float] = {}  # alert group key -> epoch
         self.last_flux_check: dict[str, float] = {}  # namespace -> epoch
         self.sem = asyncio.Semaphore(MAX_CONCURRENT_INVESTIGATIONS)
@@ -244,17 +259,20 @@ class Bot:
                 chat_id,
                 f"Connected to the {AGENT_NAME} agent. Ask about the cluster in plain language.\n"
                 "/new starts a fresh session. Alerts are posted here automatically."
-                + ("\n/music <question> asks the music curator, for example /music more like Sushin Shyam." if MUSIC_MCP_URL else ""),
+                + "".join(f"\n{c['command']} <question> asks the {c['name']}, for example {c['examples'][0]}." for c in CURATORS),
             )
             return
         if text.startswith("/new"):
             self.sessions.pop(chat_id, None)
-            self.music_sessions.pop(chat_id, None)
+            for key in [k for k in self.curator_sessions if k[1] == chat_id]:
+                self.curator_sessions.pop(key)
             await self.send(chat_id, "New session started.")
             return
-        if text.startswith("/music"):
-            await self.handle_music(chat_id, text[len("/music"):].strip())
-            return
+        command, _, rest = text.partition(" ")
+        for cur in CURATORS:
+            if command.split("@")[0] == cur["command"]:
+                await self.handle_curator(cur, chat_id, rest.strip())
+                return
         if text.startswith("/prs"):
             if not self.gh:
                 await self.send(chat_id, "Merge policy is not configured.")
@@ -263,7 +281,7 @@ class Bot:
             await self.send(chat_id, summary or "No open pull request needs a decision.")
             return
         if text.startswith("/"):
-            await self.send(chat_id, "Unknown command. Use /new, /music or just ask a question.")
+            await self.send(chat_id, "Unknown command. Use /new" + "".join(f", {c['command']}" for c in CURATORS) + " or just ask a question.")
             return
         context_id = self.sessions.setdefault(chat_id, str(uuid.uuid4()))
         await self.tg("sendChatAction", chat_id=chat_id, action="typing")
@@ -274,50 +292,44 @@ class Bot:
             answer = f"The agent call failed: {type(e).__name__}: {e}"
         await self.send(chat_id, answer)
 
-    # ---------- Music digest ----------
-    async def handle_music(self, chat_id: str, question: str) -> None:
-        if not MUSIC_MCP_URL:
-            await self.send(chat_id, "The music curator is not configured.")
-            return
+    # ---------- Curator digests (music, movies) ----------
+    async def handle_curator(self, cur: dict, chat_id: str, question: str) -> None:
         if not question:
-            await self.send(chat_id, "Ask the music curator something, for example:\n"
-                                     "/music more like Vidyasagar's 2000s songs\n/music new Malayalam film albums this month")
+            await self.send(chat_id, f"Ask the {cur['name']} something, for example:\n" + "\n".join(cur["examples"]))
             return
-        context_id = self.music_sessions.setdefault(chat_id, str(uuid.uuid4()))
+        context_id = self.curator_sessions.setdefault((cur["prefix"], chat_id), str(uuid.uuid4()))
         started = datetime.now(timezone.utc)
         await self.tg("sendChatAction", chat_id=chat_id, action="typing")
         try:
-            answer = await self.ask_agent(question, context_id, agent=MUSIC_AGENT)
+            answer = await self.ask_agent(question, context_id, agent=cur["agent"])
         except Exception as e:
-            log.exception("music agent call failed for chat %s", chat_id)
-            answer = f"The music curator call failed: {type(e).__name__}: {e}"
-        await self.send(chat_id, f"🎵 {answer}")
-        await self.post_digest_buttons(chat_id, started)
+            log.exception("%s call failed for chat %s", cur["agent"], chat_id)
+            answer = f"The {cur['name']} call failed: {type(e).__name__}: {e}"
+        await self.send(chat_id, f"{cur['emoji']} {answer}")
+        await self.post_digest_buttons(cur, chat_id, started)
 
-    async def post_digest_buttons(self, chat_id: str, since: datetime) -> None:
+    async def post_digest_buttons(self, cur: dict, chat_id: str, since: datetime) -> None:
         """Post feedback buttons for the digest stored during this run, if there is one."""
-        if not MUSIC_MCP_URL:
-            return
         try:
-            async with self.http.get(f"{MUSIC_MCP_URL}/digest", timeout=ClientTimeout(total=15)) as r:
+            async with self.http.get(f"{cur['url']}/digest", timeout=ClientTimeout(total=15)) as r:
                 if r.status != 200:
                     return
                 digest = await r.json()
         except Exception as e:
-            log.warning("music digest fetch failed: %s", type(e).__name__)
+            log.warning("%s digest fetch failed: %s", cur["agent"], type(e).__name__)
             return
         items = [i for i in digest.get("items") or [] if i.get("id")]
         created = parse_rfc3339(digest.get("created_at"))
         if not items or created is None or created < since.timestamp() - 60:
             return  # nothing stored in this run
-        rows = [self.music_row(i) for i in items[:30]]
+        rows = [self.digest_row(cur, i) for i in items[:30]]
         await self.tg("sendMessage", chat_id=chat_id, disable_web_page_preview=True,
-                      text=f"Rate digest {digest['id']}: 👍 like, 👎 not for me, ⬇ want it in the library.",
+                      text=f"Rate {cur['kind']} digest {digest['id']}: 👍 like, 👎 not for me, ⬇ {cur['want']}.",
                       reply_markup={"inline_keyboard": rows})
 
     @staticmethod
     def qobuz_search_url(item: dict) -> str | None:
-        """Qobuz store search for a digest item: short title plus first artist for tracks, title for albums."""
+        """Qobuz store search for a music digest item: short title plus first artist for tracks, title for albums."""
         title = re.split(r"\s*[(\[]", item.get("title") or "")[0].strip()
         if not QOBUZ_STORE or not title:
             return None
@@ -329,21 +341,22 @@ class Bot:
         return f"https://www.qobuz.com/{QOBUZ_STORE}/search/{section}/{quote(query, safe='')}"
 
     @staticmethod
-    def music_row(item: dict, chosen: str | None = None) -> list[dict]:
+    def digest_row(cur: dict, item: dict, chosen: str | None = None) -> list[dict]:
+        p, sid = cur["prefix"], item["id"]
         short = re.split(r"\s*[(\[]", item.get("title") or "")[0].strip() or item.get("title", "")
-        label = f"{item['id']}. {short}"[:24]
+        label = f"{sid}. {short}"[:24]
         chosen = chosen or {"like": "l", "dislike": "d", "want": "w"}.get(item.get("feedback") or "")
-        url = Bot.qobuz_search_url(item)
-        # The title cell opens the Qobuz search when there is one, otherwise it is a plain label.
-        row = [{"text": f"🔎 {label}", "url": url} if url else {"text": label, "callback_data": f"f:{item['id']}:n"}]
-        for code, (_, emoji) in MUSIC_ACTIONS.items():
-            row.append({"text": f"✓{emoji}" if code == chosen else emoji, "callback_data": f"f:{item['id']}:{code}"})
+        # The title cell opens the item's page (movies: TMDB) or a Qobuz search (music), else it is a label.
+        url = item.get("search_url") or (Bot.qobuz_search_url(item) if p == "f" else None)
+        row = [{"text": f"🔎 {label}", "url": url} if url else {"text": label, "callback_data": f"{p}:{sid}:n"}]
+        for code, (_, emoji) in DIGEST_ACTIONS.items():
+            row.append({"text": f"✓{emoji}" if code == chosen else emoji, "callback_data": f"{p}:{sid}:{code}"})
         return row
 
-    async def handle_music_callback(self, cq: dict, chat_id: str, data: str) -> None:
+    async def handle_digest_callback(self, cur: dict, cq: dict, chat_id: str, data: str) -> None:
         cq_id = cq.get("id")
         try:
-            _, sid, code = data.split(":")
+            p, sid, code = data.split(":")
             sid = int(sid)
         except Exception:
             await self.tg("answerCallbackQuery", callback_query_id=cq_id, text="Bad button data.")
@@ -351,31 +364,30 @@ class Bot:
         if code == "n":  # the title cell is a label, not an action
             await self.tg("answerCallbackQuery", callback_query_id=cq_id, text="Use 👍, 👎 or ⬇ on this row.")
             return
-        if code not in MUSIC_ACTIONS or not MUSIC_MCP_URL:
+        if code not in DIGEST_ACTIONS:
             await self.tg("answerCallbackQuery", callback_query_id=cq_id, text="Unknown action.")
             return
-        action, emoji = MUSIC_ACTIONS[code]
+        action, emoji = DIGEST_ACTIONS[code]
         try:
-            async with self.http.post(f"{MUSIC_MCP_URL}/feedback", json={"id": sid, "action": action},
+            async with self.http.post(f"{cur['url']}/feedback", json={"id": sid, "action": action},
                                       timeout=ClientTimeout(total=15)) as r:
                 ok = r.status == 200
                 body = await r.json()
         except Exception as e:
-            log.warning("music feedback failed: %s", type(e).__name__)
+            log.warning("%s feedback failed: %s", cur["agent"], type(e).__name__)
             ok, body = False, {}
         if not ok:
             await self.tg("answerCallbackQuery", callback_query_id=cq_id, text="Could not save that, try again later.")
             return
-        log.info("music feedback %s on suggestion %s", action, sid)
+        log.info("%s feedback %s on suggestion %s", cur["kind"], action, sid)
         await self.tg("answerCallbackQuery", callback_query_id=cq_id, text=f"{emoji} saved for {body.get('title', sid)}")
         # Tick the pressed button in place.
         message = cq.get("message") or {}
         keyboard = (message.get("reply_markup") or {}).get("inline_keyboard") or []
         new_rows = []
         for row in keyboard:
-            if any(str(b.get("callback_data", "")).startswith(f"f:{sid}:") for b in row):
-                label = row[0]  # keep the title cell exactly as posted
-                row = [label] + self.music_row({"id": sid}, chosen=code)[1:]
+            if any(str(b.get("callback_data", "")).startswith(f"{p}:{sid}:") for b in row):
+                row = [row[0]] + self.digest_row(cur, {"id": sid}, chosen=code)[1:]  # keep the title cell as posted
             new_rows.append(row)
         await self.tg("editMessageReplyMarkup", chat_id=chat_id, message_id=message.get("message_id"),
                       reply_markup={"inline_keyboard": new_rows})
@@ -552,8 +564,8 @@ class Bot:
                 log.exception("task '%s' failed", title)
                 answer = f"Task failed: {type(e).__name__}: {e}"
         await self.send(ALERT_CHAT_ID, f"🗓 {title}:\n{answer}")
-        if agent == MUSIC_AGENT:
-            await self.post_digest_buttons(ALERT_CHAT_ID, started)
+        if agent in CURATOR_BY_AGENT:
+            await self.post_digest_buttons(CURATOR_BY_AGENT[agent], ALERT_CHAT_ID, started)
         if self.gh and agent and agent != AGENT_NAME:
             asyncio.create_task(self.merge_policy_pass(reason=f"task {title}"))
         return web.json_response({"ok": True, "chars": len(answer)})
@@ -678,8 +690,8 @@ class Bot:
         chat_id = str(((cq.get("message") or {}).get("chat") or {}).get("id") or "")
         from_id = str((cq.get("from") or {}).get("id") or "")
         data = cq.get("data") or ""
-        if chat_id in ALLOWED_CHAT_IDS and data.startswith("f:"):
-            await self.handle_music_callback(cq, chat_id, data)
+        if chat_id in ALLOWED_CHAT_IDS and data[:2] in {f"{p}:" for p in CURATOR_BY_PREFIX}:
+            await self.handle_digest_callback(CURATOR_BY_PREFIX[data[0]], cq, chat_id, data)
             return
         if chat_id not in ALLOWED_CHAT_IDS or not self.gh:
             await self.tg("answerCallbackQuery", callback_query_id=cq_id, text="Not authorized.")

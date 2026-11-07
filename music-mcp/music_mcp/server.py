@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from collections import Counter
 from datetime import date, timedelta
 
@@ -29,6 +30,13 @@ from .sources import LastFm, YtMusic
 from .store import ACTIONS, Store
 
 log = logging.getLogger("music-mcp")
+
+# Real YouTube Music links. Anything else (truncated or invented by the model) is looked up again.
+YTM_URL_RE = re.compile(
+    r"^https://music\.youtube\.com/(watch\?v=[\w-]{11}|browse/MPREb_[\w-]{8,}|channel/UC[\w-]{20,}|playlist\?list=[\w-]{10,})$"
+)
+# A digest run that calls record_digest more than once within this window keeps adding to one digest.
+OPEN_DIGEST_MINUTES = int(os.environ.get("OPEN_DIGEST_MINUTES", "40"))
 
 ALLOWED_HOSTS = [h.strip() for h in os.environ.get("ALLOWED_HOSTS", "localhost,127.0.0.1").split(",") if h.strip()]
 
@@ -275,6 +283,112 @@ async def search(query: str, kind: str = "songs", limit: int = 8) -> dict:
     return {"query": query, "results": results}
 
 
+_ytm_sem = asyncio.Semaphore(4)
+
+
+async def _limited(coro):
+    async with _ytm_sem:
+        return await coro
+
+
+def _auto_seeds(lib, st, days: int, max_seeds: int) -> list[dict]:
+    """Seeds for a digest: recently added albums (one owned track each, distinct album artists, newest
+    first), then liked or wanted suggestions."""
+    since = (date.today() - timedelta(days=days)).isoformat()
+    seeds, seen_artists = [], set()
+    recent = sorted((a for a in lib.albums if a.added >= since), key=lambda a: a.added, reverse=True)
+    for album in recent:
+        if len(seeds) >= max_seeds - 1:
+            break
+        lead = album.artists[0] if album.artists else None
+        if lead and artist_key(lead) in seen_artists:
+            continue
+        track = next((t for t in lib.tracks if t.album == album.name), None)
+        if not track:
+            continue
+        seen_artists.add(artist_key(lead or (track.artists[0] if track.artists else "")))
+        seeds.append({"artist": lead or ", ".join(track.artists[:2]), "title": track.title,
+                      "why": f"you added {album.name} ({album.year or 'year unknown'})"})
+    for r in st.history(days=365, limit=200):
+        if len(seeds) >= max_seeds:
+            break
+        if r["feedback"] in ("like", "want") and r["kind"] == "track":
+            seeds.append({"artist": r["artist"], "title": r["title"], "why": f"you {r['feedback']}d {r['title']}"})
+    return seeds[:max_seeds]
+
+
+@mcp.tool()
+async def digest_candidates(seeds: list[dict] | None = None, max_seeds: int = 5, per_seed: int = 8) -> dict:
+    """Everything needed for a digest in one call. Seeds default to recently added albums and liked or
+    wanted suggestions; pass seeds as [{artist, title}] to override. For each seed it gathers related
+    tracks (YouTube Music radio, Last.fm), plus similar artists for the first two seeds and albums that
+    recur among the related tracks. Owned items, earlier suggestions and disliked artists are removed.
+    Pick from `tracks` and `albums`, then call record_digest once."""
+    lib = await jellyfin().library()
+    st = store()
+    errors: list[str] = []
+    if seeds:
+        seeds = [{"artist": s.get("artist", ""), "title": s.get("title", ""), "why": s.get("why") or "requested"}
+                 for s in seeds if s.get("artist") and s.get("title")][:max_seeds]
+    else:
+        seeds = _auto_seeds(lib, st, days=75, max_seeds=max_seeds)
+    if not seeds:
+        return {"error": "no seeds: nothing added in the last 75 days and no feedback yet; pass seeds"}
+
+    async def per(seed):
+        yt = await _safe(_limited(ytm().related_tracks(seed["artist"], seed["title"], per_seed + 8)), "ytmusic", errors)
+        lf = await _safe(lastfm().similar_tracks(seed["artist"], seed["title"], per_seed), "lastfm", errors)
+        related = (yt[1] if yt else []) + (lf or [])
+        for r in related:
+            r["seed"] = seed["why"]
+        return related
+
+    async def sim(seed):
+        a = split_artists(seed["artist"])[0] if split_artists(seed["artist"]) else seed["artist"]
+        y = await _safe(_limited(ytm().related_artists(a, 8)), "ytmusic", errors)
+        l = await _safe(lastfm().similar_artists(a, 8), "lastfm", errors)
+        out = (y or []) + (l or [])
+        for r in out:
+            r["seed"] = seed["why"]
+        return out
+
+    per_results = await asyncio.gather(*(per(s) for s in seeds))
+    sim_results = await asyncio.gather(*(sim(s) for s in seeds[:2]))
+
+    tracks, dropped = await _filter([r for rs in per_results for r in rs])
+    # Keep the best per_seed tracks for each seed so one seed cannot crowd out the others.
+    by_seed: dict[str, int] = Counter()
+    picked = []
+    for t in tracks:
+        if by_seed[t["seed"]] < per_seed:
+            by_seed[t["seed"]] += 1
+            picked.append({k: t.get(k) for k in ("artist", "title", "album", "year", "url", "sources", "seed", "new_artist")})
+
+    # Albums: soundtracks that several related tracks come from and that the listener does not own.
+    album_hits: dict[str, dict] = {}
+    for t in tracks:
+        name = (t.get("album") or "").strip()
+        if not name or lib.owns_album(t["artist"], name):
+            continue
+        a = album_hits.setdefault(name.lower(), {"title": name, "artist": t["artist"], "year": t.get("year"),
+                                                 "seed": t["seed"], "count": 0})
+        a["count"] += 1
+    albums = sorted((a for a in album_hits.values() if a["count"] >= 2), key=lambda a: -a["count"])[:8]
+    for a in albums:
+        a["kind"] = "album"
+
+    artists, _ = await _filter([r for rs in sim_results for r in rs])
+    return {
+        "seeds": seeds,
+        "tracks": picked,
+        "albums": albums,
+        "similar_artists": [{"artist": a["artist"], "sources": a["sources"], "seed": a["seed"]} for a in artists[:10]],
+        "dropped": dropped,
+        "errors": sorted(set(errors)),
+        "next": "Pick about 10 tracks and 3 albums, then call record_digest once with all of them.",
+    }
+
+
 # ---------------------------------------------------------------- memory tools
 
 
@@ -293,9 +407,10 @@ async def feedback_summary() -> dict:
 
 @mcp.tool()
 async def record_digest(items: list[dict], note: str | None = None) -> dict:
-    """Store this digest's final picks. Each item: {kind: "track"|"album", artist, title, album?, year?,
-    reason, url?}. `reason` is one short line shown to the listener. Items already owned or suggested
-    before are rejected; missing preview links are looked up. Call this once, then write the digest."""
+    """Store this digest's final picks, all of them in ONE call. Each item: {kind: "track"|"album", artist,
+    title, album?, year?, reason, url?}. `reason` is one short line shown to the listener. Owned tracks
+    and albums and earlier suggestions are rejected; missing or invalid links are looked up. Calls within
+    the same run add to the same digest."""
     lib = await jellyfin().library()
     st = store()
     accepted, rejected = [], []
@@ -307,10 +422,14 @@ async def record_digest(items: list[dict], note: str | None = None) -> dict:
         if it["kind"] == "track" and lib.owns_track(it["artist"], it["title"]):
             rejected.append({**it, "why": "owned"})
             continue
+        if it["kind"] == "album" and lib.owns_album(it["artist"], it["title"]):
+            rejected.append({**it, "why": "owned album"})
+            continue
         if st.already_suggested(it["artist"], it["title"]):
             rejected.append({**it, "why": "suggested before"})
             continue
-        if not it["url"]:
+        if not (it["url"] and YTM_URL_RE.match(it["url"])):
+            it["url"] = None
             try:
                 kind = "songs" if it["kind"] == "track" else "albums"
                 hits = await ytm().search(f'{it["artist"]} {it["title"]}', kind, 1)
@@ -318,10 +437,18 @@ async def record_digest(items: list[dict], note: str | None = None) -> dict:
             except Exception as e:
                 log.warning("link lookup failed: %s", e)
         accepted.append(it)
+    open_id = st.open_digest_id(OPEN_DIGEST_MINUTES)
     if not accepted:
-        return {"digest_id": None, "stored": [], "rejected": rejected}
-    digest_id, stored = st.record_digest(accepted, note)
-    return {"digest_id": digest_id, "stored": stored, "rejected": rejected}
+        return {"digest_id": open_id, "stored": [], "rejected": rejected}
+    digest_id, stored = st.record_digest(accepted, note, append_to=open_id)
+    total = len(st.digest(digest_id)["items"])
+    return {
+        "digest_id": digest_id,
+        "stored": [{"id": x["id"], "kind": x["kind"], "artist": x["artist"], "title": x["title"], "url": x["url"]} for x in stored],
+        "rejected": rejected,
+        "digest_items_total": total,
+        "next": "Done. Do not call record_digest again; write the digest from all stored items.",
+    }
 
 
 # ---------------------------------------------------------------- HTTP routes for the bot

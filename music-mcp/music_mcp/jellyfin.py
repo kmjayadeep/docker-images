@@ -46,6 +46,21 @@ class Library:
     def owns_artist(self, artist: str) -> str | None:
         return self.artists.lookup(artist)
 
+    def owns_album(self, artist: str, title: str) -> Album | None:
+        wanted = {self.artists.lookup(a) for a in split_artists(artist)} - {None}
+        key = title_key(title)
+        for a in self.albums:
+            if title_key(a.name) != key and not same_title(a.name, title):
+                continue
+            if not wanted or not a.artists or wanted & set(a.artists):
+                return a
+        # A soundtrack is often credited to singers on one side and the composer on the other; a title match
+        # against an album whose tracks share any wanted artist also counts.
+        for t in self.tracks:
+            if title_key(t.album) == key and wanted & set(t.artists + [self.artists.lookup(t.album_artist)]):
+                return next((a for a in self.albums if a.name == t.album), None) or Album("", t.album, [], t.year, [], t.added)
+        return None
+
     def owns_track(self, artist: str, title: str) -> Track | None:
         wanted = {self.artists.lookup(a) for a in split_artists(artist)} - {None}
         key = title_key(title)

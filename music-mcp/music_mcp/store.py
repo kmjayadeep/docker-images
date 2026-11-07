@@ -73,10 +73,20 @@ class Store:
             keys.update(artist_key(a) for a in split_artists(r["artist"]))
         return keys
 
-    def record_digest(self, items: list[dict], note: str | None = None) -> tuple[int, list[dict]]:
+    def open_digest_id(self, minutes: int) -> int | None:
+        """The newest digest if it was created in the last `minutes` minutes (one agent run = one digest)."""
+        since = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).replace(microsecond=0).isoformat()
+        rows = self._rows("SELECT id FROM digests WHERE created_at >= ? ORDER BY id DESC LIMIT 1", since)
+        return rows[0]["id"] if rows else None
+
+    def record_digest(self, items: list[dict], note: str | None = None,
+                      append_to: int | None = None) -> tuple[int, list[dict]]:
         with self._lock:
-            cur = self._db.execute("INSERT INTO digests (created_at, note) VALUES (?, ?)", (_now(), note))
-            digest_id = cur.lastrowid
+            if append_to is not None:
+                digest_id = append_to
+            else:
+                cur = self._db.execute("INSERT INTO digests (created_at, note) VALUES (?, ?)", (_now(), note))
+                digest_id = cur.lastrowid
             stored = []
             for it in items:
                 cur = self._db.execute(

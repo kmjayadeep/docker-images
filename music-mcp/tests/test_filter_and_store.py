@@ -102,8 +102,33 @@ def test_record_digest_rejects_owned_and_repeats(env, monkeypatch):
 
     again = run(server.record_digest([{"kind": "track", "artist": "Sushin Shyam, Pranavam Sasi",
                                        "title": 'Armadham (From "Aavesham")', "reason": "x"}]))
-    assert again["digest_id"] is None
+    assert again["stored"] == []
     assert again["rejected"][0]["why"] == "suggested before"
+
+    owned_album = run(server.record_digest([{"kind": "album", "artist": "Shaan Rahman", "title": "Godha", "reason": "x"}]))
+    assert owned_album["rejected"][0]["why"] == "owned album"
+
+
+def test_record_digest_appends_and_fixes_links(env, monkeypatch):
+    looked_up = []
+
+    async def search(query, kind, limit):
+        looked_up.append(query)
+        return [{"url": "https://music.youtube.com/watch?v=abcdefghijk"}]
+
+    class FakeYt:
+        pass
+
+    FakeYt.search = staticmethod(search)
+    monkeypatch.setattr(server, "_ytm", FakeYt())
+    first = run(server.record_digest([{"kind": "track", "artist": "Deepak Dev", "title": "Manassin Muriyude", "reason": "r",
+                                       "url": "https://music.youtube.com/watch?v=nhXgLy8Lkow"}]))
+    second = run(server.record_digest([{"kind": "album", "artist": "Vidyasagar", "title": "Oru Maravathoor Kanavu", "reason": "r",
+                                        "url": "https://music.youtube.com/browse/MPREb"}]))
+    assert first["digest_id"] == second["digest_id"]
+    assert second["digest_items_total"] == 2
+    assert looked_up == ["Vidyasagar Oru Maravathoor Kanavu"]
+    assert second["stored"][0]["url"] == "https://music.youtube.com/watch?v=abcdefghijk"
 
 
 def test_feedback_dislike_filters_artist(env):
@@ -130,3 +155,34 @@ def test_digest_and_wants(env):
 def test_profile_ranks_composers(env):
     p = run(server.library_profile())
     assert p["top_album_artists"][0] == {"artist": "Shaan Rahman", "tracks": 2}
+
+
+def test_digest_candidates_auto_seeds_and_albums(env, monkeypatch):
+    async def related_tracks(artist, title, limit):
+        seed = {"artist": artist, "title": title}
+        rel = [
+            {"kind": "track", "artist": "Vidyasagar, Sujatha", "title": "Song A", "album": "Film X", "source": "ytmusic-radio", "score": 1},
+            {"kind": "track", "artist": "Vidyasagar", "title": "Song B", "album": "Film X", "source": "ytmusic-radio", "score": 0.9},
+            {"kind": "track", "artist": "Shaan Rahman, Gowry Lekshmi", "title": "Aaro Nenjil", "album": "Godha", "source": "ytmusic-radio", "score": 0.8},
+        ]
+        return seed, [dict(r) for r in rel]
+
+    async def related_artists(artist, limit):
+        return [{"kind": "artist", "artist": "Sushin Shyam", "source": "ytmusic", "score": 1}]
+
+    class FakeYt:
+        pass
+
+    FakeYt.related_tracks = staticmethod(related_tracks)
+    FakeYt.related_artists = staticmethod(related_artists)
+    monkeypatch.setattr(server, "_ytm", FakeYt())
+    monkeypatch.setattr(server, "_lfm", server.LastFm(None))
+    import datetime as dt
+    for a in server._jf.lib.albums:
+        a.added = dt.date.today().isoformat()
+    res = run(server.digest_candidates())
+    assert res["seeds"][0]["artist"] == "Shaan Rahman"
+    titles = [t["title"] for t in res["tracks"]]
+    assert "Aaro Nenjil" not in titles and "Song A" in titles
+    assert res["albums"][0]["title"] == "Film X" and res["albums"][0]["count"] == 2
+    assert res["similar_artists"][0]["artist"] == "Sushin Shyam"

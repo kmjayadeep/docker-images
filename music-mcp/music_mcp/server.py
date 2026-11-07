@@ -495,6 +495,8 @@ async def get_wants(_: Request) -> JSONResponse:
 
 def main() -> None:
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    # httpx logs every request URL at INFO, and the Last.fm and TMDB keys travel as query parameters.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     store()  # create the schema before serving
     mcp.run(transport="streamable-http")
 

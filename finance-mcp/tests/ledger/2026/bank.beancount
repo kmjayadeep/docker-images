@@ -1,0 +1,37 @@
+2026-01-05 * "Employer" "salary"
+  Assets:Cash:Bank   5000 CHF
+  Income:Salary
+
+2026-01-10 * "Broker" "buy"
+  Assets:Investments:Broker:ACME  10 ACME {100 USD}
+  Assets:Cash:Bank               -800 CHF @ 1.25 USD
+
+2026-01-11 * "Gift" "unpriced holding"
+  Assets:Investments:Broker:XYZ  5 XYZ
+  Equity:Opening
+
+2026-01-21 * "Cafe" "trip lunch" #trip-x
+  Expenses:Food      12 CHF
+  Assets:Cash:Bank
+
+2026-01-25 * "Transfer" "to India"
+  Assets:Cash:India  10000 INR @@ 100 CHF
+  Assets:Cash:Bank
+
+2026-02-05 * "Employer" "salary"
+  Assets:Cash:Bank   5000 CHF
+  Income:Salary
+
+2026-02-10 * "Shop" "groceries"
+  Expenses:Food      200 CHF
+  Assets:Cash:Bank
+
+2026-02-15 * "Shop" "India groceries"
+  Expenses:Food      1000 INR
+  Assets:Cash:India
+
+2026-02-20 balance Assets:Cash:Bank  8888 CHF
+
+2026-03-01 * "Projected" "not real yet" #UPCOMING
+  Expenses:Food      999 CHF
+  Assets:Cash:Bank

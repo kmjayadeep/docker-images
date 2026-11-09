@@ -1,0 +1,7 @@
+2026-01-15 * "Shop" "groceries"
+  Expenses:Food         100 CHF
+  Liabilities:CC:Card
+
+2026-01-20 * "Airline" "trip flight" #trip-x
+  Expenses:Travel       50 EUR @@ 40 CHF
+  Liabilities:CC:Card  -40 CHF

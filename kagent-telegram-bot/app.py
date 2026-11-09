@@ -73,6 +73,8 @@ MUSIC_MCP_URL = os.environ.get("MUSIC_MCP_URL", "").rstrip("/")
 MUSIC_AGENT = os.environ.get("MUSIC_AGENT", "music-curator")
 MOVIE_MCP_URL = os.environ.get("MOVIE_MCP_URL", "").rstrip("/")
 MOVIE_AGENT = os.environ.get("MOVIE_AGENT", "movie-curator")
+# Empty disables /money. It asks the agent directly and has no digest or feedback buttons.
+FINANCE_AGENT = os.environ.get("FINANCE_AGENT", "")
 DIGEST_ACTIONS = {"l": ("like", "👍"), "d": ("dislike", "👎"), "w": ("want", "⬇")}
 # Qobuz store whose search the title button opens, as in https://www.qobuz.com/ch-fr/search/tracks/...
 # Empty keeps the title button as a plain label.
@@ -86,7 +88,10 @@ CURATORS = [c for c in (
     {"prefix": "v", "kind": "movie", "command": "/movie", "emoji": "🎬", "name": "movie curator",
      "agent": MOVIE_AGENT, "url": MOVIE_MCP_URL, "want": "want to watch",
      "examples": ["/movie something like Bulbbul", "/movie new Malayalam thrillers this month"]},
-) if c["url"]]
+    {"prefix": "m", "kind": "money", "command": "/money", "emoji": "💰", "name": "finance agent",
+     "agent": FINANCE_AGENT, "url": "", "digest": False, "want": "",
+     "examples": ["/money what is my net worth", "/money what did my last trip cost"]},
+) if c["url"] or (c["agent"] and not c.get("digest", True))]
 CURATOR_BY_PREFIX = {c["prefix"]: c for c in CURATORS}
 CURATOR_BY_AGENT = {c["agent"]: c for c in CURATORS}
 MERGE_POLICY_INTERVAL_SECONDS = int(os.environ.get("MERGE_POLICY_INTERVAL_SECONDS", "1800"))
@@ -310,6 +315,8 @@ class Bot:
 
     async def post_digest_buttons(self, cur: dict, chat_id: str, since: datetime) -> None:
         """Post feedback buttons for the digest stored during this run, if there is one."""
+        if not cur.get("digest", True):
+            return
         try:
             async with self.http.get(f"{cur['url']}/digest", timeout=ClientTimeout(total=15)) as r:
                 if r.status != 200:

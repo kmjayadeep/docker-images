@@ -1,0 +1,18 @@
+option "operating_currency" "CHF"
+plugin "beancount.plugins.implicit_prices"
+
+include "2026/*"
+
+2020-01-01 open Assets:Cash:Bank
+2020-01-01 open Assets:Cash:India
+2020-01-01 open Assets:Investments:Broker:ACME
+2020-01-01 open Assets:Investments:Broker:XYZ
+2020-01-01 open Liabilities:CC:Card
+2020-01-01 open Expenses:Food
+2020-01-01 open Expenses:Travel
+2020-01-01 open Income:Salary
+2020-01-01 open Equity:Opening
+
+2026-01-01 price USD 0.80 CHF
+2026-01-01 price INR 0.01 CHF
+2026-02-01 price ACME 150 USD

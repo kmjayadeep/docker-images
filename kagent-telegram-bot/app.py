@@ -75,6 +75,8 @@ MOVIE_MCP_URL = os.environ.get("MOVIE_MCP_URL", "").rstrip("/")
 MOVIE_AGENT = os.environ.get("MOVIE_AGENT", "movie-curator")
 # Empty disables /money. It asks the agent directly and has no digest or feedback buttons.
 FINANCE_AGENT = os.environ.get("FINANCE_AGENT", "")
+# Empty disables /home (Home Assistant agent). Like /money: a direct question, no digest buttons.
+HOME_AGENT = os.environ.get("HOME_AGENT", "")
 DIGEST_ACTIONS = {"l": ("like", "👍"), "d": ("dislike", "👎"), "w": ("want", "⬇")}
 # Qobuz store whose search the title button opens, as in https://www.qobuz.com/ch-fr/search/tracks/...
 # Empty keeps the title button as a plain label.
@@ -91,6 +93,9 @@ CURATORS = [c for c in (
     {"prefix": "m", "kind": "money", "command": "/money", "emoji": "💰", "name": "finance agent",
      "agent": FINANCE_AGENT, "url": "", "digest": False, "want": "",
      "examples": ["/money what is my net worth", "/money what did my last trip cost"]},
+    {"prefix": "h", "kind": "home", "command": "/home", "emoji": "🏠", "name": "home agent",
+     "agent": HOME_AGENT, "url": "", "digest": False, "want": "",
+     "examples": ["/home is the living room light on", "/home set the wake time to 06:30"]},
 ) if c["url"] or (c["agent"] and not c.get("digest", True))]
 CURATOR_BY_PREFIX = {c["prefix"]: c for c in CURATORS}
 CURATOR_BY_AGENT = {c["agent"]: c for c in CURATORS}
@@ -110,7 +115,8 @@ AGENT_NAME = os.environ.get("AGENT_DISPLAY_NAME", "homelab-sre")
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 TG_MAX_LEN = 4000
-SECRET_PATTERN = re.compile(r"(sk-[A-Za-z0-9_-]{8,}|glsa_[A-Za-z0-9_-]{8,}|Bearer\s+[A-Za-z0-9._-]{8,})")
+# Also JWTs (Home Assistant long-lived tokens).
+SECRET_PATTERN = re.compile(r"(sk-[A-Za-z0-9_-]{8,}|glsa_[A-Za-z0-9_-]{8,}|Bearer\s+[A-Za-z0-9._-]{8,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})")
 
 
 def redact(text: str) -> str:

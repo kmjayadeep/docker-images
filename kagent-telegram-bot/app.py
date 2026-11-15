@@ -30,6 +30,13 @@ Two flows share this process:
    button row per item. A press is sent to the server (POST /feedback); nothing goes through a
    model. The title button opens the item's page (movies: TMDB) or a Qobuz search (music).
    /music and /movie talk to their agent in a separate session per chat.
+7. Chat UX: the commands are registered with Telegram (setMyCommands, scoped to the allowed chats) so
+   they show up in the / menu. /home, /money, /music and /movie switch the chat to that agent: later
+   plain messages go there until /sre switches back. Sent without a question, they also post quick
+   question buttons. The typing indicator is kept up while an agent works. Agent answers are sent as
+   Telegram HTML converted from their Markdown (plain text if Telegram rejects it). Replying to a bot
+   message asks the agent that wrote it (by its emoji; anything else goes to the SRE agent) and quotes
+   the replied-to message so the agent knows what "this" is.
 
 Configuration is by environment variables; the bot token is never logged.
 """
@@ -37,6 +44,7 @@ Configuration is by environment variables; the bot token is never logged.
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 import os
@@ -86,18 +94,32 @@ QOBUZ_STORE = os.environ.get("QOBUZ_STORE", "ch-fr").strip("/")
 CURATORS = [c for c in (
     {"prefix": "f", "kind": "music", "command": "/music", "emoji": "🎵", "name": "music curator",
      "agent": MUSIC_AGENT, "url": MUSIC_MCP_URL, "want": "want it in the library",
-     "examples": ["/music more like Vidyasagar's 2000s songs", "/music new Malayalam film albums this month"]},
+     "examples": ["/music more like Vidyasagar's 2000s songs", "/music new Malayalam film albums this month"],
+     "quick": [("🎧 Something new", "Suggest a few songs I have not heard, based on what I liked."),
+               ("💿 New albums", "Any new Malayalam film albums this month?")]},
     {"prefix": "v", "kind": "movie", "command": "/movie", "emoji": "🎬", "name": "movie curator",
      "agent": MOVIE_AGENT, "url": MOVIE_MCP_URL, "want": "want to watch",
-     "examples": ["/movie something like Bulbbul", "/movie new Malayalam thrillers this month"]},
+     "examples": ["/movie something like Bulbbul", "/movie new Malayalam thrillers this month"],
+     "quick": [("🍿 Tonight", "Suggest one movie for tonight from what I liked."),
+               ("🆕 New releases", "Any new Malayalam movies worth watching this month?")]},
     {"prefix": "m", "kind": "money", "command": "/money", "emoji": "💰", "name": "finance agent",
      "agent": FINANCE_AGENT, "url": "", "digest": False, "want": "",
-     "examples": ["/money what is my net worth", "/money what did my last trip cost"]},
+     "examples": ["/money what is my net worth", "/money what did my last trip cost"],
+     "quick": [("📊 Net worth", "What is my net worth?"),
+               ("🧾 This month", "How much have I spent this month, by category?")]},
     {"prefix": "h", "kind": "home", "command": "/home", "emoji": "🏠", "name": "home agent",
      "agent": HOME_AGENT, "url": "", "digest": False, "want": "",
-     "examples": ["/home is the living room light on", "/home set the wake time to 06:30"]},
+     "examples": ["/home is the living room light on", "/home set the wake time to 06:30"],
+     "quick": [("💡 Light", "Is the living room light on?"),
+               ("⚡ Power", "How much power are the homelab sockets drawing now, and how much energy today?"),
+               ("⏰ Wake time", "What is the weekday wake time?"),
+               ("🌤 Weather", "What is the weather today?")]},
 ) if c["url"] or (c["agent"] and not c.get("digest", True))]
 CURATOR_BY_PREFIX = {c["prefix"]: c for c in CURATORS}
+# Only curators with digests own a callback namespace: "m" is also the merge button's ("m:<repo>:<n>:<sha>").
+DIGEST_BY_PREFIX = {c["prefix"]: c for c in CURATORS if c.get("digest", True)}
+SRE_QUICK = [("🩺 Health", "Is anything in the cluster unhealthy right now? Short answer."),
+             ("🔥 Alerts", "Which alerts are firing right now?")]
 CURATOR_BY_AGENT = {c["agent"]: c for c in CURATORS}
 MERGE_POLICY_INTERVAL_SECONDS = int(os.environ.get("MERGE_POLICY_INTERVAL_SECONDS", "1800"))
 MERGE_POLICY_ENABLED = bool(GITHUB_APP_ID and GITHUB_APP_INSTALLATION_ID and GITHUB_APP_PRIVATE_KEY and GITHUB_REPOS)
@@ -126,6 +148,89 @@ def redact(text: str) -> str:
 def chunks(text: str, size: int = TG_MAX_LEN):
     for i in range(0, len(text), size):
         yield text[i : i + size]
+
+
+def text_chunks(text: str, size: int = TG_MAX_LEN - 500):
+    """Split on line boundaries (never inside a code block when avoidable) so each chunk converts on its own."""
+    out, cur = [], ""
+    for line in text.splitlines(keepends=True):
+        if len(cur) + len(line) > size and cur:
+            out.append(cur)
+            cur = ""
+        while len(line) > size:
+            out.append(line[:size])
+            line = line[size:]
+        cur += line
+    if cur:
+        out.append(cur)
+    # Keep code fences balanced per chunk.
+    for i, c in enumerate(out):
+        if c.count("```") % 2:
+            out[i] = c + "\n```"
+            if i + 1 < len(out):
+                out[i + 1] = "```\n" + out[i + 1]
+    return out
+
+
+_INLINE = [
+    (re.compile(r"`([^`\n]+)`"), r"<code>\1</code>"),
+    (re.compile(r"\[([^\]\n]+)\]\((https?://[^)\s]+)\)"), r'<a href="\2">\1</a>'),
+    (re.compile(r"\*\*(?=\S)(.+?)(?<=\S)\*\*"), r"<b>\1</b>"),
+    (re.compile(r"__(?=\S)(.+?)(?<=\S)__"), r"<b>\1</b>"),
+    (re.compile(r"(?<![\w*])\*(?=[^\s*])([^*\n]+?)(?<=[^\s*])\*(?![\w*])"), r"<i>\1</i>"),
+    (re.compile(r"(?<![\w_])_(?=[^\s_])([^_\n]+?)(?<=[^\s_])_(?![\w_])"), r"<i>\1</i>"),
+    (re.compile(r"~~(?=\S)(.+?)(?<=\S)~~"), r"<s>\1</s>"),
+]
+
+
+def _inline(line: str) -> str:
+    # Protect inline code from the other rules.
+    parts = re.split(r"(`[^`\n]+`)", line)
+    out = []
+    for part in parts:
+        if part.startswith("`") and part.endswith("`") and len(part) > 1:
+            out.append(f"<code>{part[1:-1]}</code>")
+            continue
+        for pattern, repl in _INLINE[1:]:
+            part = pattern.sub(repl, part)
+        out.append(part)
+    return "".join(out)
+
+
+def md_to_html(text: str) -> str:
+    """The Markdown agents write (headings, bold, italics, code, links, lists, tables) as Telegram HTML."""
+    out, in_code, code = [], False, []
+    for raw in html.escape(text, quote=False).split("\n"):
+        if raw.strip().startswith("```"):
+            if in_code:
+                out.append("<pre>" + "\n".join(code) + "</pre>")
+                code, in_code = [], False
+            else:
+                in_code = True
+            continue
+        if in_code:
+            code.append(raw)
+            continue
+        line = raw.rstrip()
+        if m := re.match(r"^\s{0,3}#{1,6}\s+(.*)$", line):
+            line = f"<b>{_inline(m.group(1).strip('# '))}</b>"
+        elif re.match(r"^\s*([-*_])(\s*\1){2,}\s*$", line):
+            line = "──────"
+        elif re.match(r"^\s*\|?\s*:?-{2,}", line) and set(line.strip()) <= set("|-: "):
+            continue  # table separator row
+        elif line.lstrip().startswith("|") and line.rstrip().endswith("|"):
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            line = " · ".join(_inline(c) for c in cells)
+        else:
+            if m := re.match(r"^(\s*)[-*+]\s+(.*)$", line):
+                line = f"{m.group(1)}• {m.group(2)}"
+            elif m := re.match(r"^(\s*)&gt;\s?(.*)$", line):
+                line = f"{m.group(1)}▎ {m.group(2)}"
+            line = _inline(line)
+        out.append(line)
+    if in_code:
+        out.append("<pre>" + "\n".join(code) + "</pre>")
+    return "\n".join(out)
 
 
 def parse_rfc3339(value: str | None) -> float | None:
@@ -213,6 +318,7 @@ class Bot:
         self.http = ClientSession(timeout=ClientTimeout(total=A2A_TIMEOUT + 30))
         self.sessions: dict[str, str] = {}  # chat id -> A2A contextId
         self.curator_sessions: dict[tuple[str, str], str] = {}  # (curator prefix, chat id) -> A2A contextId
+        self.modes: dict[str, str] = {}  # chat id -> curator prefix that plain messages go to (absent: SRE)
         self.last_investigation: dict[str, float] = {}  # alert group key -> epoch
         self.last_flux_check: dict[str, float] = {}  # namespace -> epoch
         self.sem = asyncio.Semaphore(MAX_CONCURRENT_INVESTIGATIONS)
@@ -229,13 +335,73 @@ class Bot:
                 log.warning("telegram %s failed: %s", method, data.get("description"))
             return data
 
-    async def send(self, chat_id: str, text: str) -> None:
+    async def send(self, chat_id: str, text: str, markdown: bool = False) -> None:
         text = redact(text) or "(empty response)"
-        for part in chunks(text):
-            await self.tg("sendMessage", chat_id=chat_id, text=part, disable_web_page_preview=True)
+        if not markdown:
+            for part in chunks(text):
+                await self.tg("sendMessage", chat_id=chat_id, text=part, disable_web_page_preview=True)
+            return
+        # Agent answers: Markdown rendered as Telegram HTML, falling back to the raw text if Telegram rejects it.
+        for part in text_chunks(text):
+            data = await self.tg("sendMessage", chat_id=chat_id, text=md_to_html(part), parse_mode="HTML",
+                                 disable_web_page_preview=True)
+            if not data.get("ok"):
+                for raw in chunks(part):
+                    await self.tg("sendMessage", chat_id=chat_id, text=raw, disable_web_page_preview=True)
+
+    async def with_typing(self, chat_id: str, coro):
+        """Await coro while showing "typing…" (Telegram clears it after about 5 s, so repeat it)."""
+        async def keep_typing():
+            while True:
+                try:
+                    await self.tg("sendChatAction", chat_id=chat_id, action="typing")
+                except Exception:
+                    pass
+                await asyncio.sleep(4.5)
+        typing = asyncio.create_task(keep_typing())
+        try:
+            return await coro
+        finally:
+            typing.cancel()
+
+    def command_menu(self) -> list[dict]:
+        cmds = [{"command": "sre", "description": f"Talk to {AGENT_NAME} (cluster questions; the default)"}]
+        cmds += [{"command": c["command"][1:], "description": f"{c['emoji']} Talk to the {c['name']}"} for c in CURATORS]
+        if self.gh:
+            cmds.append({"command": "prs", "description": "Pull requests waiting for a merge decision"})
+        cmds += [{"command": "new", "description": "Start fresh sessions (forget the conversation)"},
+                 {"command": "help", "description": "What this bot can do"}]
+        return cmds
+
+    async def register_commands(self) -> None:
+        """Show the commands in Telegram's / menu, only in the allowed chats."""
+        cmds = self.command_menu()
+        for chat_id in ALLOWED_CHAT_IDS:
+            try:
+                await self.tg("setMyCommands", commands=cmds, scope={"type": "chat", "chat_id": int(chat_id)})
+            except Exception as e:
+                log.warning("setMyCommands failed: %s", type(e).__name__)
+
+    def help_text(self, chat_id: str) -> str:
+        cur = CURATOR_BY_PREFIX.get(self.modes.get(chat_id, ""))
+        now = f"{cur['emoji']} the {cur['name']}" if cur else f"{AGENT_NAME}"
+        lines = [f"Plain messages go to {now} right now. Alerts are posted here automatically.", "",
+                 f"/sre switches back to {AGENT_NAME} (cluster questions)."]
+        lines += [f"{c['command']} switches to the {c['name']}; add a question to ask it at once, "
+                  f"e.g. {c['examples'][0]}" for c in CURATORS]
+        if self.gh:
+            lines.append("/prs lists pull requests waiting for a merge decision.")
+        lines.append("/new forgets the conversation and starts fresh sessions.")
+        return "\n".join(lines)
+
+    @staticmethod
+    def quick_keyboard(prefix: str, quick: list[tuple[str, str]]) -> dict:
+        buttons = [{"text": label, "callback_data": f"q:{prefix}:{i}"} for i, (label, _) in enumerate(quick)]
+        return {"inline_keyboard": [buttons[i:i + 2] for i in range(0, len(buttons), 2)]}
 
     async def poll_telegram(self) -> None:
         offset = None
+        await self.register_commands()
         # Drop anything that queued up while we were down.
         await self.tg("deleteWebhook", drop_pending_updates=True)
         self.ready = True
@@ -265,58 +431,82 @@ class Bot:
             log.warning("unauthorized chat id %s (user %s)", chat_id, (msg.get("from") or {}).get("username"))
             await self.send(chat_id, f"Not authorized. This chat id is {chat_id}.")
             return
-        if text.startswith("/start"):
-            await self.send(
-                chat_id,
-                f"Connected to the {AGENT_NAME} agent. Ask about the cluster in plain language.\n"
-                "/new starts a fresh session. Alerts are posted here automatically."
-                + "".join(f"\n{c['command']} <question> asks the {c['name']}, for example {c['examples'][0]}." for c in CURATORS),
-            )
+        command, _, rest = text.partition(" ")
+        command = command.split("@")[0].lower() if command.startswith("/") else ""
+        if command in ("/start", "/help"):
+            await self.send(chat_id, self.help_text(chat_id))
             return
-        if text.startswith("/new"):
+        if command == "/sre":
+            self.modes.pop(chat_id, None)
+            if rest.strip():
+                await self.ask_sre(chat_id, rest.strip())
+            else:
+                await self.tg("sendMessage", chat_id=chat_id, text=f"Plain messages now go to {AGENT_NAME}.",
+                              reply_markup=self.quick_keyboard("sre", SRE_QUICK))
+            return
+        if command == "/new":
             self.sessions.pop(chat_id, None)
             for key in [k for k in self.curator_sessions if k[1] == chat_id]:
                 self.curator_sessions.pop(key)
             await self.send(chat_id, "New session started.")
             return
-        command, _, rest = text.partition(" ")
         for cur in CURATORS:
-            if command.split("@")[0] == cur["command"]:
+            if command == cur["command"]:
+                self.modes[chat_id] = cur["prefix"]
                 await self.handle_curator(cur, chat_id, rest.strip())
                 return
-        if text.startswith("/prs"):
+        if command == "/prs":
             if not self.gh:
                 await self.send(chat_id, "Merge policy is not configured.")
                 return
             summary = await self.merge_policy_pass(reason="/prs")
             await self.send(chat_id, summary or "No open pull request needs a decision.")
             return
-        if text.startswith("/"):
-            await self.send(chat_id, "Unknown command. Use /new" + "".join(f", {c['command']}" for c in CURATORS) + " or just ask a question.")
+        if command:
+            await self.send(chat_id, "Unknown command. /help lists them.")
             return
+        replied = msg.get("reply_to_message") or {}
+        if replied.get("text") and (replied.get("from") or {}).get("is_bot"):
+            # A reply goes to the agent that wrote the message (by its emoji), with the message quoted.
+            quoted = replied["text"].strip()
+            cur = next((c for c in CURATORS if quoted.startswith(c["emoji"])), None)
+            question = f"I am replying to this earlier message:\n<<<\n{quoted[:2000]}\n>>>\n\n{text}"
+            if cur:
+                await self.handle_curator(cur, chat_id, question)
+            else:
+                await self.ask_sre(chat_id, question)
+            return
+        cur = CURATOR_BY_PREFIX.get(self.modes.get(chat_id, ""))
+        if cur:
+            await self.handle_curator(cur, chat_id, text)
+            return
+        await self.ask_sre(chat_id, text)
+
+    async def ask_sre(self, chat_id: str, text: str) -> None:
         context_id = self.sessions.setdefault(chat_id, str(uuid.uuid4()))
-        await self.tg("sendChatAction", chat_id=chat_id, action="typing")
         try:
-            answer = await self.ask_agent(text, context_id)
+            answer = await self.with_typing(chat_id, self.ask_agent(text, context_id))
         except Exception as e:
             log.exception("agent call failed for chat %s", chat_id)
             answer = f"The agent call failed: {type(e).__name__}: {e}"
-        await self.send(chat_id, answer)
+        await self.send(chat_id, answer, markdown=True)
 
     # ---------- Curator digests (music, movies) ----------
     async def handle_curator(self, cur: dict, chat_id: str, question: str) -> None:
         if not question:
-            await self.send(chat_id, f"Ask the {cur['name']} something, for example:\n" + "\n".join(cur["examples"]))
+            text = (f"{cur['emoji']} Plain messages now go to the {cur['name']}; /sre switches back. "
+                    f"Ask anything, for example: {cur['examples'][-1].split(' ', 1)[1]}")
+            await self.tg("sendMessage", chat_id=chat_id, text=text,
+                          reply_markup=self.quick_keyboard(cur["prefix"], cur.get("quick") or []))
             return
         context_id = self.curator_sessions.setdefault((cur["prefix"], chat_id), str(uuid.uuid4()))
         started = datetime.now(timezone.utc)
-        await self.tg("sendChatAction", chat_id=chat_id, action="typing")
         try:
-            answer = await self.ask_agent(question, context_id, agent=cur["agent"])
+            answer = await self.with_typing(chat_id, self.ask_agent(question, context_id, agent=cur["agent"]))
         except Exception as e:
             log.exception("%s call failed for chat %s", cur["agent"], chat_id)
             answer = f"The {cur['name']} call failed: {type(e).__name__}: {e}"
-        await self.send(chat_id, f"{cur['emoji']} {answer}")
+        await self.send(chat_id, f"{cur['emoji']} {answer}", markdown=True)
         await self.post_digest_buttons(cur, chat_id, started)
 
     async def post_digest_buttons(self, cur: dict, chat_id: str, since: datetime) -> None:
@@ -495,7 +685,7 @@ class Bot:
             except Exception as e:
                 log.exception("investigation failed for %s", name)
                 answer = f"Investigation failed: {type(e).__name__}: {e}"
-            await self.send(ALERT_CHAT_ID, f"🔎 {AGENT_NAME} on {name}:\n{answer}")
+            await self.send(ALERT_CHAT_ID, f"🔎 {AGENT_NAME} on {name}:\n{answer}", markdown=True)
 
     # ---------- Flux failure investigation ----------
     async def flux(self, request: web.Request) -> web.Response:
@@ -551,7 +741,7 @@ class Bot:
             if answer.lstrip().upper().startswith("OK") and not FLUX_POST_OK:
                 log.info("flux failure in %s healed (not posted): %s", ns, answer[:200].replace("\n", " "))
                 return
-            await self.send(ALERT_CHAT_ID, f"🔁 Flux failure in {ns}:\n{answer}")
+            await self.send(ALERT_CHAT_ID, f"🔁 Flux failure in {ns}:\n{answer}", markdown=True)
 
     # ---------- Scheduled tasks ----------
     async def task(self, request: web.Request) -> web.Response:
@@ -576,7 +766,7 @@ class Bot:
             except Exception as e:
                 log.exception("task '%s' failed", title)
                 answer = f"Task failed: {type(e).__name__}: {e}"
-        await self.send(ALERT_CHAT_ID, f"🗓 {title}:\n{answer}")
+        await self.send(ALERT_CHAT_ID, f"🗓 {title}:\n{answer}", markdown=True)
         if agent in CURATOR_BY_AGENT:
             await self.post_digest_buttons(CURATOR_BY_AGENT[agent], ALERT_CHAT_ID, started)
         if self.gh and agent and agent != AGENT_NAME:
@@ -698,13 +888,34 @@ class Bot:
             pass
         return True, ""
 
+    async def handle_quick_callback(self, cq: dict, chat_id: str, data: str) -> None:
+        """A quick question button: ask its question as if typed, in that agent's session."""
+        try:
+            _, prefix, idx = data.split(":")
+            cur = CURATOR_BY_PREFIX.get(prefix)
+            label, question = (cur.get("quick") or [] if cur else SRE_QUICK)[int(idx)]
+        except Exception:
+            await self.tg("answerCallbackQuery", callback_query_id=cq.get("id"), text="Unknown button.")
+            return
+        await self.tg("answerCallbackQuery", callback_query_id=cq.get("id"), text=label)
+        await self.send(chat_id, f"› {question}")
+        if cur:
+            self.modes[chat_id] = prefix
+            await self.handle_curator(cur, chat_id, question)
+        else:
+            self.modes.pop(chat_id, None)
+            await self.ask_sre(chat_id, question)
+
     async def handle_callback(self, cq: dict) -> None:
         cq_id = cq.get("id")
         chat_id = str(((cq.get("message") or {}).get("chat") or {}).get("id") or "")
         from_id = str((cq.get("from") or {}).get("id") or "")
         data = cq.get("data") or ""
-        if chat_id in ALLOWED_CHAT_IDS and data[:2] in {f"{p}:" for p in CURATOR_BY_PREFIX}:
-            await self.handle_digest_callback(CURATOR_BY_PREFIX[data[0]], cq, chat_id, data)
+        if chat_id in ALLOWED_CHAT_IDS and data.startswith("q:"):
+            await self.handle_quick_callback(cq, chat_id, data)
+            return
+        if chat_id in ALLOWED_CHAT_IDS and data[:2] in {f"{p}:" for p in DIGEST_BY_PREFIX}:
+            await self.handle_digest_callback(DIGEST_BY_PREFIX[data[0]], cq, chat_id, data)
             return
         if chat_id not in ALLOWED_CHAT_IDS or not self.gh:
             await self.tg("answerCallbackQuery", callback_query_id=cq_id, text="Not authorized.")

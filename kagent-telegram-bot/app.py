@@ -33,7 +33,10 @@ Two flows share this process:
 7. Chat UX: the commands are registered with Telegram (setMyCommands, scoped to the allowed chats) so
    they show up in the / menu. /home, /money, /music and /movie switch the chat to that agent: later
    plain messages go there until /sre switches back. Sent without a question, they also post quick
-   question buttons. The typing indicator is kept up while an agent works.
+   question buttons. The typing indicator is kept up while an agent works. Agent answers are sent as
+   Telegram HTML converted from their Markdown (plain text if Telegram rejects it). Replying to a bot
+   message asks the agent that wrote it (by its emoji; anything else goes to the SRE agent) and quotes
+   the replied-to message so the agent knows what "this" is.
 
 Configuration is by environment variables; the bot token is never logged.
 """
@@ -41,6 +44,7 @@ Configuration is by environment variables; the bot token is never logged.
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 import os
@@ -146,6 +150,89 @@ def chunks(text: str, size: int = TG_MAX_LEN):
         yield text[i : i + size]
 
 
+def text_chunks(text: str, size: int = TG_MAX_LEN - 500):
+    """Split on line boundaries (never inside a code block when avoidable) so each chunk converts on its own."""
+    out, cur = [], ""
+    for line in text.splitlines(keepends=True):
+        if len(cur) + len(line) > size and cur:
+            out.append(cur)
+            cur = ""
+        while len(line) > size:
+            out.append(line[:size])
+            line = line[size:]
+        cur += line
+    if cur:
+        out.append(cur)
+    # Keep code fences balanced per chunk.
+    for i, c in enumerate(out):
+        if c.count("```") % 2:
+            out[i] = c + "\n```"
+            if i + 1 < len(out):
+                out[i + 1] = "```\n" + out[i + 1]
+    return out
+
+
+_INLINE = [
+    (re.compile(r"`([^`\n]+)`"), r"<code>\1</code>"),
+    (re.compile(r"\[([^\]\n]+)\]\((https?://[^)\s]+)\)"), r'<a href="\2">\1</a>'),
+    (re.compile(r"\*\*(?=\S)(.+?)(?<=\S)\*\*"), r"<b>\1</b>"),
+    (re.compile(r"__(?=\S)(.+?)(?<=\S)__"), r"<b>\1</b>"),
+    (re.compile(r"(?<![\w*])\*(?=[^\s*])([^*\n]+?)(?<=[^\s*])\*(?![\w*])"), r"<i>\1</i>"),
+    (re.compile(r"(?<![\w_])_(?=[^\s_])([^_\n]+?)(?<=[^\s_])_(?![\w_])"), r"<i>\1</i>"),
+    (re.compile(r"~~(?=\S)(.+?)(?<=\S)~~"), r"<s>\1</s>"),
+]
+
+
+def _inline(line: str) -> str:
+    # Protect inline code from the other rules.
+    parts = re.split(r"(`[^`\n]+`)", line)
+    out = []
+    for part in parts:
+        if part.startswith("`") and part.endswith("`") and len(part) > 1:
+            out.append(f"<code>{part[1:-1]}</code>")
+            continue
+        for pattern, repl in _INLINE[1:]:
+            part = pattern.sub(repl, part)
+        out.append(part)
+    return "".join(out)
+
+
+def md_to_html(text: str) -> str:
+    """The Markdown agents write (headings, bold, italics, code, links, lists, tables) as Telegram HTML."""
+    out, in_code, code = [], False, []
+    for raw in html.escape(text, quote=False).split("\n"):
+        if raw.strip().startswith("```"):
+            if in_code:
+                out.append("<pre>" + "\n".join(code) + "</pre>")
+                code, in_code = [], False
+            else:
+                in_code = True
+            continue
+        if in_code:
+            code.append(raw)
+            continue
+        line = raw.rstrip()
+        if m := re.match(r"^\s{0,3}#{1,6}\s+(.*)$", line):
+            line = f"<b>{_inline(m.group(1).strip('# '))}</b>"
+        elif re.match(r"^\s*([-*_])(\s*\1){2,}\s*$", line):
+            line = "──────"
+        elif re.match(r"^\s*\|?\s*:?-{2,}", line) and set(line.strip()) <= set("|-: "):
+            continue  # table separator row
+        elif line.lstrip().startswith("|") and line.rstrip().endswith("|"):
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            line = " · ".join(_inline(c) for c in cells)
+        else:
+            if m := re.match(r"^(\s*)[-*+]\s+(.*)$", line):
+                line = f"{m.group(1)}• {m.group(2)}"
+            elif m := re.match(r"^(\s*)&gt;\s?(.*)$", line):
+                line = f"{m.group(1)}▎ {m.group(2)}"
+            line = _inline(line)
+        out.append(line)
+    if in_code:
+        out.append("<pre>" + "\n".join(code) + "</pre>")
+    return "\n".join(out)
+
+
 def parse_rfc3339(value: str | None) -> float | None:
     """Alertmanager timestamps ("2026-10-28T07:48:21.526100123Z") as epoch seconds; None if unparseable."""
     if not value:
@@ -248,10 +335,19 @@ class Bot:
                 log.warning("telegram %s failed: %s", method, data.get("description"))
             return data
 
-    async def send(self, chat_id: str, text: str) -> None:
+    async def send(self, chat_id: str, text: str, markdown: bool = False) -> None:
         text = redact(text) or "(empty response)"
-        for part in chunks(text):
-            await self.tg("sendMessage", chat_id=chat_id, text=part, disable_web_page_preview=True)
+        if not markdown:
+            for part in chunks(text):
+                await self.tg("sendMessage", chat_id=chat_id, text=part, disable_web_page_preview=True)
+            return
+        # Agent answers: Markdown rendered as Telegram HTML, falling back to the raw text if Telegram rejects it.
+        for part in text_chunks(text):
+            data = await self.tg("sendMessage", chat_id=chat_id, text=md_to_html(part), parse_mode="HTML",
+                                 disable_web_page_preview=True)
+            if not data.get("ok"):
+                for raw in chunks(part):
+                    await self.tg("sendMessage", chat_id=chat_id, text=raw, disable_web_page_preview=True)
 
     async def with_typing(self, chat_id: str, coro):
         """Await coro while showing "typing…" (Telegram clears it after about 5 s, so repeat it)."""
@@ -369,6 +465,17 @@ class Bot:
         if command:
             await self.send(chat_id, "Unknown command. /help lists them.")
             return
+        replied = msg.get("reply_to_message") or {}
+        if replied.get("text") and (replied.get("from") or {}).get("is_bot"):
+            # A reply goes to the agent that wrote the message (by its emoji), with the message quoted.
+            quoted = replied["text"].strip()
+            cur = next((c for c in CURATORS if quoted.startswith(c["emoji"])), None)
+            question = f"I am replying to this earlier message:\n<<<\n{quoted[:2000]}\n>>>\n\n{text}"
+            if cur:
+                await self.handle_curator(cur, chat_id, question)
+            else:
+                await self.ask_sre(chat_id, question)
+            return
         cur = CURATOR_BY_PREFIX.get(self.modes.get(chat_id, ""))
         if cur:
             await self.handle_curator(cur, chat_id, text)
@@ -382,7 +489,7 @@ class Bot:
         except Exception as e:
             log.exception("agent call failed for chat %s", chat_id)
             answer = f"The agent call failed: {type(e).__name__}: {e}"
-        await self.send(chat_id, answer)
+        await self.send(chat_id, answer, markdown=True)
 
     # ---------- Curator digests (music, movies) ----------
     async def handle_curator(self, cur: dict, chat_id: str, question: str) -> None:
@@ -399,7 +506,7 @@ class Bot:
         except Exception as e:
             log.exception("%s call failed for chat %s", cur["agent"], chat_id)
             answer = f"The {cur['name']} call failed: {type(e).__name__}: {e}"
-        await self.send(chat_id, f"{cur['emoji']} {answer}")
+        await self.send(chat_id, f"{cur['emoji']} {answer}", markdown=True)
         await self.post_digest_buttons(cur, chat_id, started)
 
     async def post_digest_buttons(self, cur: dict, chat_id: str, since: datetime) -> None:
@@ -578,7 +685,7 @@ class Bot:
             except Exception as e:
                 log.exception("investigation failed for %s", name)
                 answer = f"Investigation failed: {type(e).__name__}: {e}"
-            await self.send(ALERT_CHAT_ID, f"🔎 {AGENT_NAME} on {name}:\n{answer}")
+            await self.send(ALERT_CHAT_ID, f"🔎 {AGENT_NAME} on {name}:\n{answer}", markdown=True)
 
     # ---------- Flux failure investigation ----------
     async def flux(self, request: web.Request) -> web.Response:
@@ -634,7 +741,7 @@ class Bot:
             if answer.lstrip().upper().startswith("OK") and not FLUX_POST_OK:
                 log.info("flux failure in %s healed (not posted): %s", ns, answer[:200].replace("\n", " "))
                 return
-            await self.send(ALERT_CHAT_ID, f"🔁 Flux failure in {ns}:\n{answer}")
+            await self.send(ALERT_CHAT_ID, f"🔁 Flux failure in {ns}:\n{answer}", markdown=True)
 
     # ---------- Scheduled tasks ----------
     async def task(self, request: web.Request) -> web.Response:
@@ -659,7 +766,7 @@ class Bot:
             except Exception as e:
                 log.exception("task '%s' failed", title)
                 answer = f"Task failed: {type(e).__name__}: {e}"
-        await self.send(ALERT_CHAT_ID, f"🗓 {title}:\n{answer}")
+        await self.send(ALERT_CHAT_ID, f"🗓 {title}:\n{answer}", markdown=True)
         if agent in CURATOR_BY_AGENT:
             await self.post_digest_buttons(CURATOR_BY_AGENT[agent], ALERT_CHAT_ID, started)
         if self.gh and agent and agent != AGENT_NAME:

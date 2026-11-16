@@ -1,4 +1,4 @@
-FROM python:3.13-slim
+FROM python:3.15-slim
 
 # The ledger mount is read-only, so Beancount must not try to write its pickle cache next to it.
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PIP_NO_CACHE_DIR=1 BEANCOUNT_DISABLE_LOAD_CACHE=1

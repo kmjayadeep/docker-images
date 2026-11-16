@@ -21,9 +21,12 @@ Two flows share this process:
    of GITHUB_REPOS, every MERGE_POLICY_INTERVAL_SECONDS and after a gitops task. Renovate PRs
    whose update types are all in AUTOMERGE_UPDATE_TYPES, that carry no AUTOMERGE_BLOCK_LABELS,
    whose checks are green and whose review comment from our own GitHub App says "Verdict: merge"
-   are merged by the bot itself. Every other reviewed Renovate PR and every kagent/* PR with
+   are merged by the bot itself. Every other reviewed PR and every kagent/* PR with
    green checks is offered to the operator in Telegram with Merge and Skip buttons; the bot
    merges only on the button press from an allow-listed chat. No model is on this path.
+   DEPLOY_ON_MERGE_REPOS (a merge deploys at once) are never merged automatically, are merged one
+   at a time, and the deploy run of each merge commit is followed and reported. Pull requests from
+   forks are reported without a merge button.
 6. Curator digest feedback (optional, needs MUSIC_MCP_URL and/or MOVIE_MCP_URL): after an answer
    from MUSIC_AGENT or MOVIE_AGENT (a weekly /task digest, or a /music or /movie question) the bot
    reads the digest that run stored in that agent's MCP server (GET /digest) and posts one 👍/👎/⬇
@@ -77,6 +80,13 @@ GITHUB_APP_PRIVATE_KEY = os.environ.get("GITHUB_APP_PRIVATE_KEY", "")
 GITHUB_REPOS = [r.strip() for r in os.environ.get("GITHUB_REPOS", "").split(",") if r.strip()]
 AUTOMERGE_UPDATE_TYPES = {t.strip() for t in os.environ.get("AUTOMERGE_UPDATE_TYPES", "patch,digest,pin,pinDigest").split(",") if t.strip()}
 AUTOMERGE_BLOCK_LABELS = {t.strip() for t in os.environ.get("AUTOMERGE_BLOCK_LABELS", "critical-infra").split(",") if t.strip()}
+# Per-repository merge behaviour, both subsets of GITHUB_REPOS.
+# SQUASH_MERGE_REPOS: squash instead of a merge commit (rulesets that require linear history).
+# DEPLOY_ON_MERGE_REPOS: a merge to the default branch deploys at once through a GitHub Actions run on the
+# merge commit. Never merged automatically, no merge while a run is still going, and the run's result is posted.
+SQUASH_MERGE_REPOS = {r.strip() for r in os.environ.get("SQUASH_MERGE_REPOS", "").split(",") if r.strip()}
+DEPLOY_ON_MERGE_REPOS = {r.strip() for r in os.environ.get("DEPLOY_ON_MERGE_REPOS", "").split(",") if r.strip()}
+DEPLOY_WATCH_TIMEOUT_SECONDS = int(os.environ.get("DEPLOY_WATCH_TIMEOUT_SECONDS", "1800"))
 MUSIC_MCP_URL = os.environ.get("MUSIC_MCP_URL", "").rstrip("/")
 MUSIC_AGENT = os.environ.get("MUSIC_AGENT", "music-curator")
 MOVIE_MCP_URL = os.environ.get("MOVIE_MCP_URL", "").rstrip("/")
@@ -838,6 +848,7 @@ class Bot:
         return {
             "number": number, "sha": sha, "title": pr.get("title") or "", "url": pr.get("html_url") or "",
             "author": author, "renovate": author == RENOVATE_LOGIN, "agent": (pr["head"].get("ref") or "").startswith(AGENT_BRANCH_PREFIX),
+            "fork": ((pr["head"].get("repo") or {}).get("full_name") or "") != repo, "base": (pr.get("base") or {}).get("ref") or "main",
             "draft": bool(pr.get("draft")), "mergeable_state": full.get("mergeable_state"), "labels": labels,
             "update_types": parse_renovate_update_types(pr.get("body") or "") if author == RENOVATE_LOGIN else set(),
             "checks_ok": checks_ok, "has_checks": has_checks, "checks_pending": checks_pending, "verdict": verdict,
@@ -852,41 +863,100 @@ class Bot:
         if f["mergeable_state"] not in ("clean",):
             return None  # unknown, dirty, behind or blocked: look again next pass
         auto = (f["renovate"] and f["verdict"] == "merge" and f["update_types"] and f["update_types"] <= AUTOMERGE_UPDATE_TYPES
-                and not (f["labels"] & AUTOMERGE_BLOCK_LABELS) and f["has_checks"] and f["checks_ok"])
+                and not (f["labels"] & AUTOMERGE_BLOCK_LABELS) and f["has_checks"] and f["checks_ok"]
+                and repo not in DEPLOY_ON_MERGE_REPOS)
+        name = repo.split("/")[-1]
         if auto:
             why = f"renovate {','.join(sorted(f['update_types']))}, checks green, review verdict merge"
             ok, detail = await self.merge_pr(repo, f, by=f"policy ({why})")
-            text = (f"✅ Auto-merged #{n} {f['title']}\n{why}\n{f['url']}" if ok else f"⚠️ Auto-merge of #{n} failed: {detail}\n{f['url']}")
+            text = (f"✅ Auto-merged {name}#{n} {f['title']}\n{why}\n{f['url']}" if ok else f"⚠️ Auto-merge of {name}#{n} failed: {detail}\n{f['url']}")
             await self.send(ALERT_CHAT_ID, text)
             return text.splitlines()[0]
-        ask = (f["renovate"] and f["verdict"] in ("merge", "hold", "needs human")) or (f["agent"] and f["checks_ok"])
+        # A verdict exists only where the review agent was asked to review: Renovate PRs everywhere, and every
+        # open PR in repositories whose scheduled review covers them.
+        ask = bool(f["verdict"]) or (f["agent"] and f["checks_ok"])
         if not ask:
             return None
-        kind = "renovate " + ",".join(sorted(f["update_types"]) or ["?"]) if f["renovate"] else "agent PR"
+        if f["renovate"]:
+            kind = "renovate " + ",".join(sorted(f["update_types"]) or ["?"])
+        elif f["agent"]:
+            kind = "agent PR"
+        else:
+            kind = f"PR by {f['author']}" + (" from a fork" if f["fork"] else "")
         meta = f"{kind}, checks {('✅' if f['checks_ok'] else '❌') if f['has_checks'] else 'none'}, verdict: {f['verdict'] or 'none'}"
         if f["labels"] & AUTOMERGE_BLOCK_LABELS:
             meta += ", " + ",".join(sorted(f["labels"] & AUTOMERGE_BLOCK_LABELS))
-        text = f"🔀 #{n} {f['title']}\n{meta}\n{f['url']}"
+        if repo in DEPLOY_ON_MERGE_REPOS:
+            meta += ", merge deploys at once"
+        text = f"🔀 {name}#{n} {f['title']}\n{meta}\n{f['url']}"
+        if f["fork"]:
+            # Code from outside the account is never one tap away from main: report it and leave the decision to GitHub.
+            await self.send(ALERT_CHAT_ID, f"{text}\nOutside pull request: no merge button, decide on GitHub.")
+            await self.gh.api("POST", f"/repos/{repo}/issues/{n}/comments",
+                              json={"body": f"{ASKED_MARKER.format(sha=f['sha'])}\nReported to the operator in Telegram without a merge button ({meta})."})
+            return f"👀 reported {name}#{n} ({meta})"
         keyboard = {"inline_keyboard": [[{"text": f"Merge #{n}", "callback_data": f"m:{GITHUB_REPOS.index(repo)}:{n}:{f['sha'][:12]}"},
                                          {"text": "Skip", "callback_data": f"s:{GITHUB_REPOS.index(repo)}:{n}:{f['sha'][:12]}"}]]}
         await self.tg("sendMessage", chat_id=ALERT_CHAT_ID, text=redact(text), disable_web_page_preview=True, reply_markup=keyboard)
         await self.gh.api("POST", f"/repos/{repo}/issues/{n}/comments",
                           json={"body": f"{ASKED_MARKER.format(sha=f['sha'])}\nMerge decision requested from the operator in Telegram ({meta})."})
-        return f"🔀 asked about #{n} ({meta})"
+        return f"🔀 asked about {name}#{n} ({meta})"
 
     async def merge_pr(self, repo: str, f: dict, by: str) -> tuple[bool, str]:
         try:
-            await self.gh.api("PUT", f"/repos/{repo}/pulls/{f['number']}/merge",
-                              json={"merge_method": "merge", "sha": f["sha"]})
+            merged = await self.gh.api("PUT", f"/repos/{repo}/pulls/{f['number']}/merge",
+                                       json={"merge_method": "squash" if repo in SQUASH_MERGE_REPOS else "merge", "sha": f["sha"]})
         except Exception as e:
             log.warning("merge of %s#%s failed: %s", repo, f["number"], e)
             return False, str(e)[:200]
         log.info("merged %s#%s %s", repo, f["number"], by)
+        if repo in DEPLOY_ON_MERGE_REPOS and isinstance(merged, dict) and merged.get("sha"):
+            asyncio.create_task(self.watch_deploy(repo, f["number"], merged["sha"]))
         try:
             await self.gh.api("DELETE", f"/repos/{repo}/git/refs/heads/{f['head_ref']}") if f.get("head_ref") else None
         except Exception:
             pass
         return True, ""
+
+    async def deploy_in_progress(self, repo: str, branch: str) -> bool:
+        """True while a workflow run on the branch has not finished. Unreadable runs (the App lacks the Actions
+        read permission) count as idle: the merge still needs the operator's button press."""
+        try:
+            data = await self.gh.api("GET", f"/repos/{repo}/actions/runs?branch={branch}&per_page=5")
+        except Exception as e:
+            log.warning("deploy check: cannot list runs of %s: %s", repo, e)
+            return False
+        return any(r.get("status") != "completed" for r in data.get("workflow_runs") or [])
+
+    async def watch_deploy(self, repo: str, number: int, sha: str) -> None:
+        """Follow the workflow runs of a merge commit and post the outcome. No model involved."""
+        name = repo.split("/")[-1]
+        deadline = time.time() + DEPLOY_WATCH_TIMEOUT_SECONDS
+        started = time.time()
+        runs: list[dict] = []
+        try:
+            while time.time() < deadline:
+                await asyncio.sleep(20)
+                data = await self.gh.api("GET", f"/repos/{repo}/actions/runs?head_sha={sha}&per_page=10")
+                runs = data.get("workflow_runs") or []
+                if runs and all(r.get("status") == "completed" for r in runs):
+                    break
+                if not runs and time.time() - started > 300:
+                    await self.send(ALERT_CHAT_ID, f"ℹ️ {name}#{number} merged ({sha[:7]}), but no deploy run started within 5 minutes.")
+                    return
+            else:
+                url = runs[0].get("html_url") if runs else ""
+                await self.send(ALERT_CHAT_ID, f"⚠️ Deploy of {name}#{number} ({sha[:7]}) is still running after {DEPLOY_WATCH_TIMEOUT_SECONDS // 60} minutes.\n{url}")
+                return
+        except Exception as e:
+            log.warning("deploy watch of %s %s failed: %s", repo, sha[:7], e)
+            await self.send(ALERT_CHAT_ID, f"⚠️ {name}#{number} merged ({sha[:7]}), but its deploy run cannot be read: {str(e)[:150]}")
+            return
+        failed = [r for r in runs if r.get("conclusion") not in ("success", "skipped", "neutral")]
+        if failed:
+            await self.send(ALERT_CHAT_ID, f"❌ Deploy of {name}#{number} ({sha[:7]}) failed: {failed[0].get('name')} {failed[0].get('conclusion')}\n{failed[0].get('html_url')}\nNothing was rolled back.")
+        else:
+            await self.send(ALERT_CHAT_ID, f"✅ Deploy of {name}#{number} ({sha[:7]}) succeeded.")
 
     async def handle_quick_callback(self, cq: dict, chat_id: str, data: str) -> None:
         """A quick question button: ask its question as if typed, in that agent's session."""
@@ -946,9 +1016,15 @@ class Bot:
             elif action == "m":
                 if f["mergeable_state"] != "clean" or (f["checks_pending"]):
                     outcome = f"⚠️ #{number} is not mergeable right now (state {f['mergeable_state']}); try again later."
+                elif f["fork"]:
+                    outcome = f"⚠️ #{number} comes from a fork; merge it on GitHub."
+                elif repo in DEPLOY_ON_MERGE_REPOS and await self.deploy_in_progress(repo, f["base"]):
+                    outcome = f"⏳ A deploy of {repo.split('/')[-1]} is still running; press Merge again when it has finished."
                 else:
                     ok, detail = await self.merge_pr(repo, f, by=f"operator (telegram user {from_id})")
                     outcome = f"✅ Merged #{number}." if ok else f"⚠️ Merge of #{number} failed: {detail}"
+                    if ok and repo in DEPLOY_ON_MERGE_REPOS:
+                        outcome += " Deploy started; the result follows."
             else:
                 outcome = "Unknown action."
         except Exception as e:

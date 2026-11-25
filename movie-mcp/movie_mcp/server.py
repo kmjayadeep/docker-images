@@ -19,7 +19,7 @@ import os
 from collections import Counter
 from datetime import date, timedelta
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -47,19 +47,12 @@ NEW_RELEASE_WINDOWS = _windows(os.environ.get("NEW_RELEASE_WINDOWS", "ml:120,en:
 # have few TMDB votes (0-10 for a new Malayalam film), so they are ranked by popularity without a floor.
 NEW_RELEASE_MIN_VOTES = {"en": 30}
 
-mcp = FastMCP(
+mcp = MCPServer(
     "movie-mcp",
     instructions=(
         "Tools for finding movies for one viewer, identified by TMDB id. Candidates come back with movies the "
         "viewer owns (Jellyfin), has already added (Radarr), was already suggested or disliked removed. "
         "record_digest stores the final picks."
-    ),
-    host=os.environ.get("HOST", "0.0.0.0"),
-    port=int(os.environ.get("PORT", "8000")),
-    stateless_http=True,
-    transport_security=TransportSecuritySettings(
-        enable_dns_rebinding_protection=True,
-        allowed_hosts=ALLOWED_HOSTS + [f"{h}:*" for h in ALLOWED_HOSTS],
     ),
 )
 
@@ -424,7 +417,17 @@ def main() -> None:
     # httpx logs every request URL at INFO, and the Last.fm and TMDB keys travel as query parameters.
     logging.getLogger("httpx").setLevel(logging.WARNING)
     store()
-    mcp.run(transport="streamable-http")
+    # mcp 2.x: transport options belong to run(), not the MCPServer constructor.
+    mcp.run(
+        transport="streamable-http",
+        host=os.environ.get("HOST", "0.0.0.0"),
+        port=int(os.environ.get("PORT", "8000")),
+        stateless_http=True,
+        transport_security=TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=ALLOWED_HOSTS + [f"{h}:*" for h in ALLOWED_HOSTS],
+        ),
+    )
 
 
 if __name__ == "__main__":

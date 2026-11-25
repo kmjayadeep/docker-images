@@ -18,7 +18,7 @@ import logging
 import os
 from collections.abc import Callable
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -29,18 +29,11 @@ log = logging.getLogger("finance-mcp")
 
 ALLOWED_HOSTS = [h.strip() for h in os.environ.get("ALLOWED_HOSTS", "localhost,127.0.0.1").split(",") if h.strip()]
 
-mcp = FastMCP(
+mcp = MCPServer(
     "finance-mcp",
     instructions=(
         "Read-only figures from one person's Beancount ledger. Every number is already computed: quote results "
         "as given and never do your own arithmetic on them. Projected entries are excluded."
-    ),
-    host=os.environ.get("HOST", "0.0.0.0"),
-    port=int(os.environ.get("PORT", "8000")),
-    stateless_http=True,
-    transport_security=TransportSecuritySettings(
-        enable_dns_rebinding_protection=True,
-        allowed_hosts=ALLOWED_HOSTS + [f"{h}:*" for h in ALLOWED_HOSTS],
     ),
 )
 
@@ -119,7 +112,17 @@ async def healthz(_: Request) -> JSONResponse:
 
 def main() -> None:
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "WARNING"), format="%(asctime)s %(levelname)s %(name)s %(message)s")
-    mcp.run(transport="streamable-http")
+    # mcp 2.x: transport options belong to run(), not the MCPServer constructor.
+    mcp.run(
+        transport="streamable-http",
+        host=os.environ.get("HOST", "0.0.0.0"),
+        port=int(os.environ.get("PORT", "8000")),
+        stateless_http=True,
+        transport_security=TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=ALLOWED_HOSTS + [f"{h}:*" for h in ALLOWED_HOSTS],
+        ),
+    )
 
 
 if __name__ == "__main__":

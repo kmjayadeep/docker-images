@@ -19,7 +19,7 @@ import re
 from collections import Counter
 from datetime import date, timedelta
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -41,20 +41,13 @@ OPEN_DIGEST_MINUTES = int(os.environ.get("OPEN_DIGEST_MINUTES", "40"))
 
 ALLOWED_HOSTS = [h.strip() for h in os.environ.get("ALLOWED_HOSTS", "localhost,127.0.0.1").split(",") if h.strip()]
 
-mcp = FastMCP(
+mcp = MCPServer(
     "music-mcp",
     instructions=(
         "Tools for finding new music for one listener. Library tools describe what they already own; "
         "discovery tools return candidates with owned and already-suggested items removed; record_digest "
         "stores the final picks. Play counts are deliberately not available: the listener plays music on a "
         "separate player, so taste comes from recent additions, favourites and feedback."
-    ),
-    host=os.environ.get("HOST", "0.0.0.0"),
-    port=int(os.environ.get("PORT", "8000")),
-    stateless_http=True,
-    transport_security=TransportSecuritySettings(
-        enable_dns_rebinding_protection=True,
-        allowed_hosts=ALLOWED_HOSTS + [f"{h}:*" for h in ALLOWED_HOSTS],
     ),
 )
 
@@ -498,7 +491,17 @@ def main() -> None:
     # httpx logs every request URL at INFO, and the Last.fm and TMDB keys travel as query parameters.
     logging.getLogger("httpx").setLevel(logging.WARNING)
     store()  # create the schema before serving
-    mcp.run(transport="streamable-http")
+    # mcp 2.x: transport options belong to run(), not the MCPServer constructor.
+    mcp.run(
+        transport="streamable-http",
+        host=os.environ.get("HOST", "0.0.0.0"),
+        port=int(os.environ.get("PORT", "8000")),
+        stateless_http=True,
+        transport_security=TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=ALLOWED_HOSTS + [f"{h}:*" for h in ALLOWED_HOSTS],
+        ),
+    )
 
 
 if __name__ == "__main__":

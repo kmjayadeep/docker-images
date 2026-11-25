@@ -13,10 +13,14 @@ Two flows share this process:
 3. Flux failure webhook (POST /flux): Alertmanager delivers Flux notification-controller
    error events (alertname Flux*: reconciliation or health check failed, Helm install/upgrade
    failed). After FLUX_VERIFY_DELAY_SECONDS the agent investigates the namespace, at most once per
-   FLUX_DEDUP_SECONDS. Successful changes never reach the agent; an answer that starts with OK
-   (the failure healed itself) is logged, not posted.
+   FLUX_DEDUP_SECONDS; the same failure (commit ids ignored) only once per FLUX_REPEAT_SECONDS.
+   Successful changes never reach the agent; an answer that starts with OK (the failure healed
+   itself) is logged, not posted.
 4. Scheduled tasks (POST /task, JSON {"agent", "prompt", "title"}): a CronJob asks any agent
-   in the same kagent namespace a question and the answer is posted to the alert chat.
+   in the same kagent namespace a question and the answer is posted to the alert chat, unless it
+   matches TASK_QUIET_PATTERN ("nothing new"). Failed agent runs on every unattended path (2-4) are
+   posted once per AGENT_ERROR_NOTIFY_SECONDS; repeats of a firing alert group with no new alert
+   once per ALERT_REPEAT_NOTIFY_SECONDS.
 5. Merge policy (optional, needs GITHUB_APP_* env): a deterministic pass over open pull requests
    of GITHUB_REPOS, every MERGE_POLICY_INTERVAL_SECONDS and after a gitops task. Renovate PRs
    whose update types are all in AUTOMERGE_UPDATE_TYPES, that carry no AUTOMERGE_BLOCK_LABELS,
@@ -71,6 +75,10 @@ A2A_BASE_URL = A2A_URL.rsplit("/", 2)[0] + "/"
 AGENT_NAME_RE = re.compile(r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$")
 FLUX_VERIFY_DELAY_SECONDS = int(os.environ.get("FLUX_VERIFY_DELAY_SECONDS", "120"))
 FLUX_DEDUP_SECONDS = int(os.environ.get("FLUX_DEDUP_SECONDS", "600"))
+# The same failure (same objects and messages, commit ids ignored) is investigated again only after
+# FLUX_REPEAT_SECONDS; it is forgotten (treated as healed) when no event arrives for FLUX_FORGET_SECONDS.
+FLUX_REPEAT_SECONDS = int(os.environ.get("FLUX_REPEAT_SECONDS", "86400"))
+FLUX_FORGET_SECONDS = int(os.environ.get("FLUX_FORGET_SECONDS", "3600"))
 # Post OK answers too (the failure healed before the agent looked)? Default: log only.
 FLUX_POST_OK = os.environ.get("FLUX_POST_OK", "false").lower() in ("1", "true", "yes")
 # Merge policy (GitHub App credentials are the same Secret the GitHub MCP server uses).
@@ -141,6 +149,15 @@ SKIPPED_MARKER = "<!-- kagent-merge-skipped sha={sha} -->"
 GH_API = "https://api.github.com"
 A2A_TIMEOUT = float(os.environ.get("A2A_TIMEOUT_SECONDS", "600"))
 ALERT_DEDUP_SECONDS = int(os.environ.get("ALERT_DEDUP_SECONDS", "3600"))
+# A repeat notification of a firing group with no new alert is posted at most once per window.
+ALERT_REPEAT_NOTIFY_SECONDS = int(os.environ.get("ALERT_REPEAT_NOTIFY_SECONDS", "86400"))
+# Unattended runs (alert, Flux, scheduled task) whose agent call failed: one post per window, the rest logged.
+AGENT_ERROR_NOTIFY_SECONDS = int(os.environ.get("AGENT_ERROR_NOTIFY_SECONDS", "3600"))
+# Scheduled-task answers matching this (case-insensitive, whole answer) are logged, not posted.
+TASK_QUIET_PATTERN = re.compile(os.environ.get("TASK_QUIET_PATTERN", r"\W*nothing new\W*"), re.IGNORECASE)
+FAILURE_PREFIXES = ("[task failed]", "[task rejected]", "[task canceled]", "agent error:",
+                    "investigation failed:", "task failed:")
+COMMIT_ID = re.compile(r"\b(?:sha1:|sha256:)?[0-9a-f]{7,64}\b")
 MAX_CONCURRENT_INVESTIGATIONS = int(os.environ.get("MAX_CONCURRENT_INVESTIGATIONS", "2"))
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8080"))
 AGENT_NAME = os.environ.get("AGENT_DISPLAY_NAME", "homelab-sre")
@@ -331,19 +348,41 @@ class Bot:
         self.modes: dict[str, str] = {}  # chat id -> curator prefix that plain messages go to (absent: SRE)
         self.last_investigation: dict[str, float] = {}  # alert group key -> epoch
         self.last_flux_check: dict[str, float] = {}  # namespace -> epoch
+        self.flux_seen: dict[str, tuple[str, float, float]] = {}  # namespace -> (fingerprint, investigated, last seen)
+        self.alert_posted: dict[str, tuple[frozenset, float]] = {}  # group key -> (firing fingerprints, posted)
+        self.last_agent_error_post = 0.0
+        self.suppressed_agent_errors = 0
         self.sem = asyncio.Semaphore(MAX_CONCURRENT_INVESTIGATIONS)
         self.ready = False
         self.gh = GitHubApp(self.http) if MERGE_POLICY_ENABLED else None
         self.policy_lock = asyncio.Lock()
 
     # ---------- Telegram ----------
-    async def tg(self, method: str, **params):
-        async with self.http.post(f"{TG_API}/{method}", json=params, timeout=ClientTimeout(total=70)) as r:
-            data = await r.json()
-            if not data.get("ok"):
-                # Never include the URL (it carries the token) in logs.
-                log.warning("telegram %s failed: %s", method, data.get("description"))
-            return data
+    async def tg(self, method: str, _attempts: int = 4, _quiet: bool = False, **params):
+        """Call the Bot API. Never raises: network errors become {"ok": False}. Transient failures
+        (network, 429, 5xx) are retried with backoff, honouring Telegram's retry_after."""
+        delay = 2.0
+        data: dict = {}
+        for attempt in range(_attempts):
+            try:
+                async with self.http.post(f"{TG_API}/{method}", json=params, timeout=ClientTimeout(total=70)) as r:
+                    data = await r.json(content_type=None)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                data = {"ok": False, "error_code": 0, "description": type(e).__name__}
+            if data.get("ok"):
+                return data
+            code = data.get("error_code") or 0
+            retry_after = (data.get("parameters") or {}).get("retry_after")
+            if not (code == 0 or code == 429 or code >= 500) or attempt == _attempts - 1:
+                break
+            await asyncio.sleep(retry_after or delay)
+            delay = min(delay * 2, 30)
+        if not _quiet:
+            # Never include the URL (it carries the token) in logs.
+            log.warning("telegram %s failed: %s", method, data.get("description"))
+        return data
 
     async def send(self, chat_id: str, text: str, markdown: bool = False) -> None:
         text = redact(text) or "(empty response)"
@@ -358,6 +397,26 @@ class Bot:
             if not data.get("ok"):
                 for raw in chunks(part):
                     await self.tg("sendMessage", chat_id=chat_id, text=raw, disable_web_page_preview=True)
+
+    @staticmethod
+    def is_failure(answer: str) -> bool:
+        return answer.lstrip().lower().startswith(FAILURE_PREFIXES)
+
+    async def post_unattended(self, header: str, answer: str) -> None:
+        """Post the result of a run nobody is waiting for. Agent failures (model down, provider out of
+        credit) repeat on every alert and task, so only one per AGENT_ERROR_NOTIFY_SECONDS is posted."""
+        if self.is_failure(answer):
+            now = time.time()
+            if now - self.last_agent_error_post < AGENT_ERROR_NOTIFY_SECONDS:
+                self.suppressed_agent_errors += 1
+                log.info("agent failure not posted (%s): %s", header.splitlines()[0], answer[:200].replace("\n", " "))
+                return
+            self.last_agent_error_post = now
+            if self.suppressed_agent_errors:
+                answer += (f"\n\n({self.suppressed_agent_errors} more failed runs since the last notice; "
+                           f"next notice in {AGENT_ERROR_NOTIFY_SECONDS // 60} min at the earliest)")
+                self.suppressed_agent_errors = 0
+        await self.send(ALERT_CHAT_ID, f"{header}\n{answer}", markdown=True)
 
     async def with_typing(self, chat_id: str, coro):
         """Await coro while showing "typing…" (Telegram clears it after about 5 s, so repeat it)."""
@@ -411,6 +470,7 @@ class Bot:
 
     async def poll_telegram(self) -> None:
         offset = None
+        failures = 0
         await self.register_commands()
         # Drop anything that queued up while we were down.
         await self.tg("deleteWebhook", drop_pending_updates=True)
@@ -420,7 +480,19 @@ class Bot:
                 params = {"timeout": 50, "allowed_updates": ["message", "callback_query"]}
                 if offset is not None:
                     params["offset"] = offset
-                data = await self.tg("getUpdates", **params)
+                data = await self.tg("getUpdates", _attempts=1, _quiet=True, **params)
+                if not data.get("ok"):
+                    # Telegram's 502s, 429s and 409s come back as answers, not exceptions: back off, or the
+                    # loop spins and Telegram rate-limits the bot.
+                    failures += 1
+                    if failures == 1 or failures % 20 == 0:
+                        log.warning("getUpdates failed (%d in a row): %s", failures, data.get("description"))
+                    retry_after = (data.get("parameters") or {}).get("retry_after")
+                    await asyncio.sleep(retry_after or min(5 * 2 ** min(failures - 1, 4), 60))
+                    continue
+                if failures:
+                    log.info("getUpdates recovered after %d failures", failures)
+                    failures = 0
                 for upd in data.get("result", []):
                     offset = upd["update_id"] + 1
                     msg = upd.get("message") or {}
@@ -662,10 +734,21 @@ class Bot:
             head += f" x{len(alerts)}"
         text = head + (f"\n{summary}" if summary else "")
         log.info("alertmanager %s %s group=%s alerts=%d", status, name, group_key, len(alerts))
-        await self.send(ALERT_CHAT_ID, text)
-        if status != "firing":
-            return web.json_response({"ok": True, "investigated": False})
         now = time.time()
+        if status != "firing":
+            self.alert_posted.pop(group_key, None)
+            await self.send(ALERT_CHAT_ID, text)
+            return web.json_response({"ok": True, "investigated": False})
+        # Alertmanager repeats a firing group every repeat_interval. Post only when an alert is new to the
+        # group, or as a reminder once per ALERT_REPEAT_NOTIFY_SECONDS.
+        firing = frozenset(a.get("fingerprint") or json.dumps(a.get("labels", {}), sort_keys=True)
+                           for a in alerts if a.get("status", "firing") == "firing")
+        prev = self.alert_posted.get(group_key)
+        if prev and firing <= prev[0] and now - prev[1] < ALERT_REPEAT_NOTIFY_SECONDS:
+            log.info("repeat of %s not posted (last posted %.0fs ago)", name, now - prev[1])
+        else:
+            self.alert_posted[group_key] = (firing, now)
+            await self.send(ALERT_CHAT_ID, text)
         # Alertmanager re-sends a firing group every repeat_interval. Only a group with an alert that started
         # inside the dedupe window is new; older repeats were investigated already (possibly before a restart).
         starts = [t for t in (parse_rfc3339(a.get("startsAt")) for a in alerts) if t is not None]
@@ -695,7 +778,7 @@ class Bot:
             except Exception as e:
                 log.exception("investigation failed for %s", name)
                 answer = f"Investigation failed: {type(e).__name__}: {e}"
-            await self.send(ALERT_CHAT_ID, f"🔎 {AGENT_NAME} on {name}:\n{answer}", markdown=True)
+            await self.post_unattended(f"🔎 {AGENT_NAME} on {name}:", answer)
 
     # ---------- Flux failure investigation ----------
     async def flux(self, request: web.Request) -> web.Response:
@@ -724,9 +807,19 @@ class Bot:
         now = time.time()
         started = []
         for ns, lines in changes.items():
+            # Flux re-sends a persistent failure every reconcile interval, often with a new revision.
+            fingerprint = "\n".join(sorted(COMMIT_ID.sub("<rev>", line) for line in lines))
+            seen = self.flux_seen.get(ns)
+            if seen and now - seen[2] > FLUX_FORGET_SECONDS:
+                seen = None  # no event for a while: it healed, a new event is a new failure
+            if seen and seen[0] == fingerprint and now - seen[1] < FLUX_REPEAT_SECONDS:
+                self.flux_seen[ns] = (fingerprint, seen[1], now)
+                log.info("flux failure in %s unchanged since %.0fs ago, not investigated again", ns, now - seen[1])
+                continue
             if now - self.last_flux_check.get(ns, 0) < FLUX_DEDUP_SECONDS:
                 continue
             self.last_flux_check[ns] = now
+            self.flux_seen[ns] = (fingerprint, now, now)
             started.append(ns)
             asyncio.create_task(self.verify_flux_change(ns, lines))
         return web.json_response({"ok": True, "checked": bool(started), "namespaces": started})
@@ -751,7 +844,7 @@ class Bot:
             if answer.lstrip().upper().startswith("OK") and not FLUX_POST_OK:
                 log.info("flux failure in %s healed (not posted): %s", ns, answer[:200].replace("\n", " "))
                 return
-            await self.send(ALERT_CHAT_ID, f"🔁 Flux failure in {ns}:\n{answer}", markdown=True)
+            await self.post_unattended(f"🔁 Flux failure in {ns}:", answer)
 
     # ---------- Scheduled tasks ----------
     async def task(self, request: web.Request) -> web.Response:
@@ -776,12 +869,18 @@ class Bot:
             except Exception as e:
                 log.exception("task '%s' failed", title)
                 answer = f"Task failed: {type(e).__name__}: {e}"
-        await self.send(ALERT_CHAT_ID, f"🗓 {title}:\n{answer}", markdown=True)
-        if agent in CURATOR_BY_AGENT:
+        if TASK_QUIET_PATTERN.fullmatch(answer.strip()):
+            log.info("task '%s' answer not posted: %s", title, answer.strip()[:200])
+        else:
+            await self.post_unattended(f"🗓 {title}:", answer)
+        failed = self.is_failure(answer)
+        if agent in CURATOR_BY_AGENT and not failed:
             await self.post_digest_buttons(CURATOR_BY_AGENT[agent], ALERT_CHAT_ID, started)
         if self.gh and agent and agent != AGENT_NAME:
             asyncio.create_task(self.merge_policy_pass(reason=f"task {title}"))
-        return web.json_response({"ok": True, "chars": len(answer)})
+        # 200 even when the agent failed: the failure was reported (or rate-limited) above, and a failed
+        # CronJob would only add a KubeJobFailed alert for the same outage.
+        return web.json_response({"ok": not failed, "chars": len(answer)})
 
     # ---------- Merge policy ----------
     async def merge_policy_loop(self) -> None:

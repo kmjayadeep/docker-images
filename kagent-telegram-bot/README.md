@@ -13,6 +13,11 @@ Telegram front end and Alertmanager webhook for a kagent agent, talking to it ov
 | `LISTEN_PORT` | HTTP port for `/alertmanager`, `/flux`, `/task` and `/healthz` (default 8080) |
 | `FLUX_VERIFY_DELAY_SECONDS` | Wait before investigating a Flux failure, so transient errors can heal (default 120) |
 | `FLUX_DEDUP_SECONDS` | One Flux investigation per namespace per window (default 600) |
+| `FLUX_REPEAT_SECONDS` | The same Flux failure (same objects and messages, commit ids ignored) is investigated again only after this long (default 86400) |
+| `FLUX_FORGET_SECONDS` | A namespace with no Flux event for this long counts as healed; its next failure is new (default 3600) |
+| `ALERT_REPEAT_NOTIFY_SECONDS` | Alertmanager repeats of a firing group with no new alert are posted at most once per window (default 86400); new alerts and resolves are always posted |
+| `AGENT_ERROR_NOTIFY_SECONDS` | Failed agent runs from alerts, Flux and `/task` (model down, provider out of credit) are posted once per window and counted, the rest only logged (default 3600). Chat answers are always sent |
+| `TASK_QUIET_PATTERN` | `/task` answers fully matching this case-insensitive regex are logged, not posted (default `\W*nothing new\W*`) |
 | `FLUX_POST_OK` | Also post answers that start with `OK`, meaning the failure healed before the agent looked (default `false`: logged only) |
 | `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID`, `GITHUB_APP_PRIVATE_KEY` | Enable the merge policy (same Secret as the GitHub MCP server) |
 | `GITHUB_REPOS` | Comma-separated `owner/repo` list the merge policy watches |
